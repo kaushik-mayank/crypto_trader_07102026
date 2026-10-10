@@ -42,6 +42,7 @@ const ALLOWED = new Set([
   'api/regime',
   'api/warmup',
   'api/events',
+  'api/sources',
 ]);
 
 /** Paths whose last segment is a variable id, matched by shape. */
@@ -133,18 +134,31 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ path: strin
     // engine it had never reached (F-050). The fix belongs here as well as in the dashboard, so the
     // mistake is named once, where the URL that caused it is in scope.
     if (!upstream.ok && !body.includes('"error"')) {
+      // A 404 has two possible causes, and **the first version of this message named the wrong one
+      // first**, which cost the owner a round trip: it blamed `CT_API_BASE` on an installation where
+      // that variable was correct, and the real problem was an engine three commits behind that had
+      // never heard of this route.
+      //
+      // The two are easy to tell apart, so the message says how rather than guessing:
+      //
+      //  - a bad `CT_API_BASE` makes **every** path 404, so nothing on the dashboard works;
+      //  - an out-of-date engine 404s only the **newer** paths, so some panels work and some do not.
+      //
+      // Version skew is listed first because that is the case where part of the dashboard still
+      // works — which is precisely when a reader is least likely to suspect the deployment.
+      const isNotFound = upstream.status === 404;
       return NextResponse.json(
         {
           error: {
             code: 'PROXY_UPSTREAM_NOT_OURS',
             problem_class: 'configuration',
-            message: `the engine answered HTTP ${upstream.status} with a body that is not one of its own responses`,
-            likely_cause:
-              upstream.status === 404
-                ? `nothing is served at /${target} — CT_API_BASE probably includes a path, so the request became a doubled one`
-                : 'the reply came from something other than this engine, or from a version of it that does not serve this path',
-            remediation:
-              'CT_API_BASE must be the host and port only, with no trailing path: http://YOUR_VM_IP:8000. Check it in Vercel -> Project -> Settings -> Environment Variables, redeploy, then run bash /opt/crypto-trader/deploy/azure/diagnose.sh on the VM if it persists.',
+            message: `the engine answered HTTP ${upstream.status} and does not serve /${target}`,
+            likely_cause: isNotFound
+              ? `the engine on the VM is running an older version that has no /${target} route. If other pages of this dashboard are working, this is the cause and CT_API_BASE is fine — a wrong CT_API_BASE would break every page, not one.`
+              : 'the reply came from something other than this engine, or from a version of it that does not serve this path',
+            remediation: isNotFound
+              ? 'update the VM: sudo bash /opt/crypto-trader/deploy/azure/update.sh — then check it came back with: systemctl is-active crypto-ingest crypto-app. Only if EVERY page is broken is CT_API_BASE the suspect; it must be the host and port only, with no /api on the end.'
+              : 'run bash /opt/crypto-trader/deploy/azure/diagnose.sh on the VM; it names the first broken link.',
             upstream_status: upstream.status,
             // The body, truncated. It is the only evidence of what actually answered, and a
             // dashboard that hides it sends the reader to the logs for one line.

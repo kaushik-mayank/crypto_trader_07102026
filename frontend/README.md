@@ -11,6 +11,7 @@ Full setup: [`../HOSTING.md`](../HOSTING.md).
 |---|---|---|
 | Suggestions | [`app/page.tsx`](app/page.tsx) | What the strategies currently say |
 | Chart | [`app/chart/page.tsx`](app/chart/page.tsx) | **The prices behind it** |
+| Data | [`app/data/page.tsx`](app/data/page.tsx) | **Is every source still arriving?** |
 
 The pairing is the point. Every panel on the suggestions page reports a *conclusion* — no
 suggestions, a regime cell, a health status — and every one of them looks identical whether the

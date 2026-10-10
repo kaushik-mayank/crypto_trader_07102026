@@ -12,7 +12,7 @@ import { useCallback, useEffect, useState } from 'react';
 
 import { ActionBar, Down, Empty, ExposureStrip, Freshness, HealthPanel, SignalCard, Warming } from '@/components/Panels';
 import { REFRESH_MS, api, type ApiResult } from '@/lib/api';
-import { panelState } from '@/lib/honesty';
+import { ageText, panelState } from '@/lib/honesty';
 
 type State = {
   signals: ApiResult | null;
@@ -51,6 +51,9 @@ export default function Page() {
   // `tests/test_frontend_contract.py` asserts the accessor by name (F-048).
   const payloadData = (sig?.payload as any)?.data;
   const data: any[] = Array.isArray(payloadData?.signals) ? payloadData.signals : [];
+  // Undefined rather than null when the engine does not publish it, so `Freshness` renders its own
+  // "the engine did not say how old this is" rather than a confident-looking zero.
+  const marketAge: number | null | undefined = payloadData?.market_data?.age_s;
 
   return (
     <main className="wrap">
@@ -75,18 +78,29 @@ export default function Page() {
           <h2>Freshness</h2>
           <div className="card">
             <div className="row">
-              <Freshness ageSeconds={envelope.age_seconds} label="market data" />
+              {/* **Market data age comes from the newest 1-minute bar, not from the envelope.**
+                  The envelope dates the payload, which for this endpoint is the newest *signal* —
+                  and a setup at an hourly horizon legitimately stays armed for hours. Judging that
+                  against a 300-second red threshold made a healthy system report "too old to act
+                  on" permanently, which is a warning nobody reads twice (F-052). */}
+              <Freshness ageSeconds={marketAge} label="market data" />
+              <span className="age age-ok">
+                newest suggestion {ageText(envelope.age_seconds)}
+              </span>
               {state.fetchedAt && (
                 <span className="age age-ok">
                   page read {Math.round((Date.now() - state.fetchedAt) / 1000)}s ago
                 </span>
               )}
             </div>
-            {/* The two ages are shown separately on purpose: a page that refreshed a second ago can
-                still be showing market data from an hour ago, and one number cannot say that. */}
             <p style={{ margin: '8px 0 0', color: 'var(--muted)' }}>
-              The first is how old the market data is. The second is how long since this page
-              re-read it. A fresh page read does not make old data current.
+              <strong style={{ color: 'var(--text)' }}>Three different ages, and only the first
+              says whether the system can see.</strong>{' '}
+              <em>Market data</em> is how old the newest price bar is — this is the one that matters,
+              and over a minute or two means data has stopped arriving. <em>Newest suggestion</em> is
+              how long ago the most recent setup was written; setups here last hours by design, so a
+              large number is normal and is not staleness. <em>Page read</em> is this browser, and a
+              fresh page read never makes old data current.
             </p>
           </div>
 

@@ -124,6 +124,23 @@ export function panelState(payload: unknown): PanelState {
 }
 
 /**
+ * A signal's `detail`, from wherever this engine puts it.
+ *
+ * **Every rule below depends on this and all of them were silently reading `undefined`.** The engine
+ * nested `detail` inside `payload`, this file read `signal.detail`, and nothing complained: the
+ * control-strategy firewall here never fired (the other two layers caught them, so nothing leaked),
+ * and `validationNotice` returned its warning only because `undefined !== true` — right answer,
+ * wrong reason, and it would have started lying the moment anything was validated (F-056).
+ *
+ * The engine now lifts `detail` to the top level. The `payload.detail` fallback stays because the VM
+ * and this deployment are updated separately, so the dashboard must read an engine that is a few
+ * commits behind — which is exactly the situation that produced this session's 404.
+ */
+export function signalDetail(signal: Record<string, any>): Record<string, any> {
+  return signal?.detail ?? signal?.payload?.detail ?? {};
+}
+
+/**
  * Whether a signal may be shown at all.
  *
  * The engine already filters control strategies out of every response, and the controls already
@@ -132,7 +149,7 @@ export function panelState(payload: unknown): PanelState {
  * if the others are absent.
  */
 export function displayable(signal: Record<string, any>): boolean {
-  const detail = signal?.detail ?? {};
+  const detail = signalDetail(signal);
   if (detail.control) return false;
   if (detail.tradeable === false) return false;
   if (signal?.tradeable === false) return false;
@@ -147,7 +164,7 @@ export function displayable(signal: Record<string, any>): boolean {
  * likely it is to.
  */
 export function confidenceCopy(signal: Record<string, any>): string {
-  const p = signal?.detail?.breakeven_hit_rate ?? signal?.breakeven_hit_rate;
+  const p = signalDetail(signal).breakeven_hit_rate ?? signal?.breakeven_hit_rate;
   if (typeof p === 'number' && Number.isFinite(p)) {
     return `needs to work ${(p * 100).toFixed(0)}% of the time to break even`;
   }
@@ -156,7 +173,7 @@ export function confidenceCopy(signal: Record<string, any>): string {
 
 /** specs/15 failure mode 3: not a badge. The caller renders this in its own bordered section. */
 export function validationNotice(signal: Record<string, any>): string | null {
-  const validated = signal?.detail?.validated;
+  const validated = signalDetail(signal).validated;
   if (validated === true) return null;
   return 'This strategy has never been tested against history. Its size is reduced accordingly, and the suggestion is for observation only.';
 }

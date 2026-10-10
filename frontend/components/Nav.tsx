@@ -14,6 +14,7 @@ import { usePathname } from 'next/navigation';
 const PAGES = [
   { href: '/', label: 'Suggestions', hint: 'what the strategies currently say' },
   { href: '/chart', label: 'Chart', hint: 'the prices behind it' },
+  { href: '/data', label: 'Data', hint: 'is every source still arriving?' },
 ];
 
 export function Nav() {
