@@ -28,6 +28,7 @@ import argparse
 import asyncio
 import signal
 import sys
+import time
 from typing import Any
 
 from config.settings import Settings
@@ -38,6 +39,7 @@ from ingest.dq import DQMonitor
 from ingest.pipeline import IngestPipeline
 from ingest.scheduler import Scheduler
 from normalize.canonical import Product, Timeframe
+from snapshot.request import build_request
 from store import open_store
 
 log = get_logger("ingest.main")
@@ -147,6 +149,59 @@ async def _run(scheduler: Scheduler) -> int:
     return 0
 
 
+def _fill_history(store: Any, settings: Any) -> None:
+    """Fill any missing price history before polling starts. **This is what makes a fresh host work.**
+
+    Polling alone cannot build history, and the reason is worth being explicit about:
+    ``poll_candles`` asks for ``refetch_bars`` intervals back from the newest stored bar, so on an
+    empty database it requests *three bars* and the next pass requests three more. The warm-up
+    needs 2,880 hourly bars. It would never arrive.
+
+    So the history check runs here, at startup, every time. It is the same idempotent plan the
+    ``bootstrap`` command uses: recomputed from the database, so a complete database costs one query
+    per series and fetches nothing. That makes the behaviour the owner asked for true without a
+    separate step — **wipe the database and restart this service, and it rebuilds the recent history
+    and then keeps it current** (F-046).
+
+    A failure here is logged and polling continues. The service's job is to keep data flowing, and
+    refusing to start because the *historical* fill failed would stop the live data too — while the
+    live data is the half that cannot be re-fetched later.
+    """
+    from bootstrap.fetch import DEFAULT_RATE, run_plan
+    from bootstrap.plan import Profile, plan
+    from ingest.client import IngestClient
+
+    now_ms = int(time.time() * 1000)
+    try:
+        current = plan(store, build_request(), now_ms=now_ms, profile=Profile.LIVE)
+    except ALL_ERRORS as e:
+        log.error("history_check_failed", error=e.to_dict(),
+                  detail="polling continues; run `python -m bootstrap --check` to see why")
+        return
+
+    if current.complete:
+        log.info("history_complete", series=len(current.jobs),
+                 detail="nothing to fetch; polling takes over from here")
+        return
+
+    log.info("history_incomplete", series=len(current.outstanding),
+             missing_bars=current.missing_total,
+             detail="filling before polling starts — polling alone cannot build history, because it "
+                    "only looks a few bars back from the newest one it already has")
+    try:
+        summary = run_plan(store, IngestClient(host_rates={"api.coindcx.com": DEFAULT_RATE,
+                                                           "public.coindcx.com": DEFAULT_RATE}),
+                           current, now_ms=now_ms)
+    except ALL_ERRORS as e:
+        log.error("history_fill_failed", error=e.to_dict(),
+                  detail="polling continues with the history that is present; re-run this service "
+                         "or `python -m bootstrap --run` to retry. The plan is recomputed each "
+                         "time, so nothing already fetched is lost")
+        return
+    log.info("history_filled", requests=summary["requests"], bars=summary["rows_written"],
+             detail="recent history is in place; polling keeps it current from here")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="crypto-trader ingest process (writes SQLite)")
     ap.add_argument("--check", action="store_true", help="validate configuration and tasks, then exit")
@@ -154,6 +209,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--futures-only", action="store_true",
                     help="skip the spot candle series (halves the request budget; disables the basis "
                          "family and the spot/futures disagreement check)")
+    ap.add_argument("--no-bootstrap", action="store_true",
+                    help="skip the startup history check (not recommended; see the note below)")
     args = ap.parse_args(argv)
 
     settings = Settings()
@@ -173,6 +230,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"STARTUP FAILED: {e}", file=sys.stderr)
         store.close()
         return 2
+
+    if not args.no_bootstrap and not args.check:
+        _fill_history(store, settings)
 
     try:
         if args.check:

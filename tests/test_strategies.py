@@ -979,3 +979,149 @@ def test_the_feature_fixture_covers_every_registered_key():
     from features.registry import all_keys
 
     assert set(every_registered_feature().values) == set(all_keys())
+
+
+# ---- published levels are rounded to the instrument's tick (F-054) --------------------------
+
+def _snapshot_with_instrument(tick: str = "0.1", asset: str = "B-BTC_USDT"):
+    """A snapshot carrying only what `publishable_levels` reads: one instrument's tick."""
+    from decimal import Decimal
+
+    from normalize.canonical import Fee, InstrumentMeta, Product
+    from snapshot.models import InstrumentKey, MarketSnapshot
+
+    meta = InstrumentMeta(
+        asset=asset, product=Product.FUTURES, tick=Decimal(tick),
+        qty_increment=Decimal("0.001"), min_notional=Decimal("60"),
+        maker_fee=Fee.from_fraction(Decimal("0.0002")),
+        taker_fee=Fee.from_fraction(Decimal("0.00059")),
+        fetched_at_ms=T0)
+    return MarketSnapshot(
+        as_of_ms=T0, code_version="cv", parameter_hash="ph",
+        instruments={InstrumentKey(asset, Product.FUTURES): meta})
+
+
+def _features(asset: str = "B-BTC_USDT"):
+    from features.value import FeatureSet
+    from normalize.canonical import Product
+
+    return FeatureSet(asset=asset, product=Product.FUTURES, as_of_ms=T0, values={})
+
+
+def test_a_long_stop_rounds_away_from_entry_and_its_target_toward_it():
+    """specs/08 §10, and the direction is the whole point.
+
+    Hand-computed on a 0.1 tick (BTC's real tick, verified live): a stop at 83287.425 rounds **down**
+    to 83287.4 — further from entry, a slightly wider loss — and a target at 83999.98 rounds **down**
+    to 83999.9, nearer entry, a slightly smaller win. Rounding to nearest would have moved both in
+    the trade's favour, flattering its reward/risk by a tick for free.
+    """
+    from decimal import Decimal
+
+    from strategy.act import Direction
+    from strategy.evaluation import Levels, publishable_levels
+
+    levels = Levels(entry=Decimal("83086.139791666666190"),
+                    stop=Decimal("83287.425"),
+                    targets=(Decimal("83999.98"),))
+    out = publishable_levels(levels, snapshot=_snapshot_with_instrument("0.1"),
+                             features=_features(), direction=Direction.LONG)
+    assert out.entry == Decimal("83086.1")
+    assert out.stop == Decimal("83287.4"), "a long's stop must round down, away from entry"
+    assert out.targets == (Decimal("83999.9"),), "a long's target must round down, toward entry"
+
+
+def test_a_short_stop_rounds_up_and_its_target_rounds_up_too():
+    """Mirror image, and both move the same way for a short: the stop is above entry so rounding up
+    is away, and the target is below entry so rounding up is nearer."""
+    from decimal import Decimal
+
+    from strategy.act import Direction
+    from strategy.evaluation import Levels, publishable_levels
+
+    levels = Levels(entry=Decimal("2511.67683333333328220"),
+                    stop=Decimal("2520.7375000000000070"),
+                    targets=(Decimal("2494.748333333333"),))
+    out = publishable_levels(levels, snapshot=_snapshot_with_instrument("0.01", "B-ETH_USDT"),
+                             features=_features("B-ETH_USDT"), direction=Direction.SHORT)
+    assert out.entry == Decimal("2511.68")
+    assert out.stop == Decimal("2520.74"), "a short's stop must round up, away from entry"
+    assert out.targets == (Decimal("2494.75"),), "a short's target must round up, toward entry"
+
+
+def test_a_residual_level_is_left_alone_because_it_is_not_a_price():
+    """C1-C's levels are a beta-adjusted spread. There is no tick for a spread, and rounding one to
+    the instrument's price increment would destroy it: a residual of -0.0414 on a 0.1 tick would
+    become -0.1, which is not the same trade, or 0, which is not a trade at all."""
+    from decimal import Decimal
+
+    from strategy.act import Direction
+    from strategy.evaluation import RESIDUAL_BASIS, Levels, publishable_levels
+
+    levels = Levels(entry=Decimal("-0.04145262148598610125"),
+                    stop=Decimal("-0.0451935447161604650"),
+                    targets=(Decimal(0),), price_basis=RESIDUAL_BASIS)
+    out = publishable_levels(levels, snapshot=_snapshot_with_instrument("0.1"),
+                             features=_features(), direction=Direction.LONG)
+    assert out.entry == levels.entry and out.stop == levels.stop
+    assert out.price_basis == RESIDUAL_BASIS
+
+
+def test_without_instrument_metadata_the_levels_are_published_unrounded_not_guessed():
+    """Invariant 1: the tick is **never** assumed. Returning them unrounded loses nothing, because
+    the risk engine already vetoes a signal with no instrument metadata on `DQ_META` — it cannot be
+    acted on either way. Inventing a tick would be the only harmful option."""
+    from decimal import Decimal
+
+    from snapshot.models import MarketSnapshot
+    from strategy.act import Direction
+    from strategy.evaluation import Levels, publishable_levels
+
+    bare = MarketSnapshot(as_of_ms=T0, code_version="cv", parameter_hash="ph")
+    levels = Levels(entry=Decimal("83086.139791666666190"), stop=Decimal("83287.425"))
+    out = publishable_levels(levels, snapshot=bare, features=_features(),
+                             direction=Direction.LONG)
+    assert out.entry == levels.entry and out.stop == levels.stop
+
+
+def test_a_level_that_is_absent_stays_absent_rather_than_becoming_zero():
+    """C3-A and C3-C arm with no entry and no stop at all. Rounding `None` into `0` would publish a
+    stop at zero, which reads as "no risk" rather than as "not decided yet"."""
+    from strategy.act import Direction
+    from strategy.evaluation import Levels, publishable_levels
+
+    out = publishable_levels(Levels(entry=None, stop=None, targets=()),
+                             snapshot=_snapshot_with_instrument(), features=_features(),
+                             direction=Direction.LONG)
+    assert out.entry is None and out.stop is None and out.targets == ()
+
+
+def test_the_rounding_rule_has_one_implementation():
+    """`to_price` (float in) and `quantize_price` (Decimal in) must not drift apart: two roundings
+    of the same rule is how a stop ends up a tick wide in the backtest and a tick narrow live."""
+    import inspect
+    from decimal import Decimal
+
+    from features.convert import RoundMode, quantize_price, to_price
+
+    assert "quantize_price" in inspect.getsource(to_price), \
+        "to_price must delegate, not re-implement the rounding"
+    for value, mode in ((100.34, RoundMode.STOP_LONG), (100.34, RoundMode.STOP_SHORT),
+                        (100.34, RoundMode.NEAREST)):
+        assert to_price(value, tick=Decimal("0.5"), mode=mode) == \
+            quantize_price(Decimal(repr(value)), tick=Decimal("0.5"), mode=mode)
+
+
+def test_c1c_declares_its_levels_as_residual_units():
+    """The field, not the prose. C1-C's `detail` has said "residual (spread) units, not price" since
+    it was written, and the dashboard rendered `entry -0.0414` anyway for weeks — because prose is
+    advice and a field can be branched on (F-051)."""
+    import inspect
+
+    from strategy.c1c_relative import C1C
+    from strategy.evaluation import RESIDUAL_BASIS
+
+    source = inspect.getsource(C1C)
+    assert "price_basis=RESIDUAL_BASIS" in source, \
+        "C1-C must declare its basis, or every consumer has to know about C1-C specifically"
+    assert RESIDUAL_BASIS != "price"

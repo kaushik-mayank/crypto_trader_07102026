@@ -126,15 +126,29 @@ class IngestPipeline:
 
     async def poll_candles(self, asset: str, product: Product, timeframe: Timeframe,
                            api_resolution: str) -> int:
-        """Re-fetch the most recent bars so the two-fetch finalization rule can settle them."""
+        """Re-fetch the most recent bars so the two-fetch finalization rule can settle them.
+
+        The window also **repairs a gap**, which is why it runs from the newest stored bar rather
+        than from now. After an outage the newest stored bar is old, so the request spans the hole
+        and the venue fills it on the next poll — no restart, no separate command.
+
+        That only worked for futures. The spot branch capped its row count at ``refetch * 4 + 10``
+        (30 bars by default) and spot candles arrive **newest-first**, so an outage longer than 30
+        intervals got the newest 30 rows back and left the hole untouched — permanently, because
+        ``bootstrap`` rebuilds futures only. The cap is now derived from the span actually being
+        asked for (F-049).
+        """
         refetch = max(2, int(self.settings.polling.refetch_bars))
         latest = self.store.latest_bar_time(asset, product, timeframe, final_only=False)
         now_ms = int(time.time() * 1000)
         start = (latest - refetch * timeframe.ms) if latest else (now_ms - refetch * timeframe.ms)
         if product is Product.SPOT:
+            # +2 for the partial bars at each end; 1000 is the venue's own ceiling, so a hole wider
+            # than that closes over several polls rather than in one.
+            span_bars = (now_ms - start) // timeframe.ms + 2
             result = await asyncio.to_thread(adapters.spot_candles, self.client, pair=asset,
                                              interval=api_resolution, start_ms=start, end_ms=now_ms,
-                                             limit=min(1000, refetch * 4 + 10))
+                                             limit=min(1000, max(refetch * 4 + 10, span_bars)))
             outcome = candle_norm.normalize_spot(result.raw, _ctx(result, endpoint="spot_candles", asset=asset,
                                                                  product=product, timeframe=timeframe))
         else:

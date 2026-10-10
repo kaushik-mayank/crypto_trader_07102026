@@ -141,6 +141,45 @@ export function signalDetail(signal: Record<string, any>): Record<string, any> {
 }
 
 /**
+ * The space a signal's levels live in: `price`, or something that is **not a price**.
+ *
+ * Reads the engine's `price_basis` first, then falls back to two things an **older** engine already
+ * published — and the fallback is not defensive padding, it is the case that actually happened.
+ * The dashboard and the engine deploy separately, so for as long as the VM lags, `price_basis` is
+ * absent and a C1-C residual of `-0.0414` would be rendered under the word *entry* exactly as
+ * before. The fix would have looked deployed and not been (F-058).
+ *
+ * `two_leg` and `levels_are` have been in C1-C's payload since it was written. Neither is as clean
+ * as a declared basis, which is why `price_basis` exists — but they are enough to know that these
+ * numbers must not be shown as a price, and that is the decision being made here.
+ */
+export function priceBasis(signal: Record<string, any>): string {
+  const detail = signalDetail(signal);
+  if (detail.price_basis) return String(detail.price_basis);
+  if (detail.two_leg === true) return 'residual';
+  if (typeof detail.levels_are === 'string' && detail.levels_are.includes('residual')) {
+    return 'residual';
+  }
+  return 'price';
+}
+
+/**
+ * Whether the engine has decided this setup's direction, or is still waiting for the market to.
+ *
+ * C3-A and C3-C arm with a placeholder direction. `pending_direction` says so; `pending` in the
+ * setup's own context is the same statement from an older engine, and `entry_triggers` with no
+ * entry is the structural signature of a bracket that has not resolved.
+ */
+export function directionPending(signal: Record<string, any>): boolean {
+  const detail = signalDetail(signal);
+  if (detail.pending_direction === true) return true;
+  if (detail.pending === true) return true;
+  // A directionless bracket: both sides armed, nothing to place yet.
+  return Array.isArray(detail.entry_triggers) && detail.entry_triggers.length > 1
+    && (signal?.entry === null || signal?.entry === undefined);
+}
+
+/**
  * Whether a signal may be shown at all.
  *
  * The engine already filters control strategies out of every response, and the controls already

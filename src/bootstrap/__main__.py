@@ -32,24 +32,18 @@ import time
 from pathlib import Path
 from typing import Any
 
-from app.__main__ import build_request
-from bootstrap.fetch import VERIFY_FRACTION, run_plan
+from bootstrap.fetch import DEFAULT_RATE, VERIFY_FRACTION, run_plan
 from bootstrap.plan import Profile, plan
 from config.settings import Settings
 from core.errors import ALL_ERRORS, BootstrapError
 from core.logging import get_logger, setup_logging
 from ingest.client import IngestClient
+from snapshot.request import build_request
 from store import open_store
 
 log = get_logger("bootstrap.main")
 
 OUT = Path("data/probe_results/bootstrap.json")
-
-#: Requests per second per host. The venue advertised 5,000 per 60 s on api.coindcx.com and did not
-#: throttle up to 10/s (F-022), so 5/s is about 6% of the advertised budget — deliberately polite,
-#: because a bootstrap competes with the live ingest process for the same budget.
-DEFAULT_RATE = 5.0
-
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="rebuild price history from the venue into SQLite")

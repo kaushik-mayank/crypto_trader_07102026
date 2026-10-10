@@ -1,364 +1,291 @@
 # Fixing the dashboard — step by step
 
-**Round 2.** Your last run fixed the engine: it is healthy, evaluating, and answering. The only thing
-left was the Cloudflare tunnel, and **we are removing it.** Vercel will now talk to your VM directly.
+**Round 5. This one is different: nothing is wrong with your VM, and nothing is wrong with your
+settings.** Your `diagnose.sh` output was clean on all eight sections and it was telling the truth.
 
-**About 15 minutes.** Copy each command exactly. If a step's output doesn't match what I describe,
-stop there and tell me what you saw.
+**The problem is that the new code never reached GitHub.** I wrote it, you deployed, and most of it
+was still sitting on my side. Twice I told you to run `update.sh` without checking whether the code
+it pulls contains the fix. That was my mistake, and this guide now has the step that was missing.
+
+**About 10 minutes.**
 
 ---
 
-## First — what your last run proved
+## What was actually wrong — three things, all mine
 
-Your diagnose output was almost all `OK`, and that matters. These are now settled:
+### 1. The engine code was never committed
 
-| | |
+Your two commits (`chart 1`, `data1`) contained **only frontend files**. Every backend change from
+the last two sessions — the `/api/candles` route the Chart page calls, `/api/sources` for the Data
+page, the price rounding, the spread/price fix — was never in a commit.
+
+So `update.sh` was doing exactly what you asked: fetching a branch whose newest commit did not have
+those routes, saying "already up to date", and restarting the same code. The chart page would have
+kept 404ing however many times you ran it.
+
+### 2. The Data page could not be committed at all
+
+The project's `.gitignore` had a line `data/` to protect the validation data. That pattern matches a
+folder called `data` **anywhere** — including `frontend/app/data/`, the new page.
+
+So `git add` skipped it, the commit succeeded, the push succeeded, Vercel built successfully, and
+**nothing reported a problem** — an ignored file is not an error. The only symptom was the 404 you
+saw. Fixed: the rule is now `/data/`, which still protects the validation data and no longer eats
+the page. There is a test that will fail if this ever happens again.
+
+### 3. BTC longs still negative
+
+Same root cause as #1. The fix needs the engine to say "these numbers are a spread, not a price",
+and the engine was never updated. I have also added a fallback so those cards render correctly even
+against an older engine — because the two halves are deployed separately and will always drift
+apart for a while.
+
+---
+
+# Part A — Push the code properly (on your laptop, not the VM)
+
+This is the part that was missing. Do it from the project folder on your PC.
+
+### A1. See what is not yet committed
+
+```bash
+git status
+```
+
+You will see a list of modified files under `src/`, `tests/`, `frontend/` and some `.md` files, plus
+an untracked file `src/snapshot/request.py`.
+
+**Read that list.** Everything in it is code that exists only on your PC.
+
+### A2. Stage everything, then check what you staged
+
+```bash
+git add -A
+git status
+```
+
+Now everything should be listed under **"Changes to be committed"** and the
+**"Changes not staged"** and **"Untracked files"** sections should be gone or empty.
+
+> **The one check that matters.** Confirm these four files are in the staged list:
+>
+> ```
+> src/api/app.py
+> src/api/services.py
+> src/snapshot/request.py
+> frontend/app/data/page.tsx
+> ```
+>
+> If `frontend/app/data/page.tsx` is missing, the `.gitignore` fix did not come through — tell me
+> before going further.
+
+### A3. Commit and push
+
+```bash
+git commit -m "chart and data pages, price rounding, spread display, deploy checks"
+git push
+```
+
+### A4. Prove it arrived
+
+```bash
+git status
+```
+
+Expected: **"nothing to commit, working tree clean"** and **"Your branch is up to date with
+'origin/main'"**.
+
+If it says "ahead of origin/main", the push did not go through. Run `git push` again and read any
+error it prints.
+
+---
+
+# Part B — Update the VM
+
+Only after Part A says "working tree clean".
+
+### B1. Update
+
+```bash
+sudo bash /opt/crypto-trader/deploy/azure/update.sh
+```
+
+Watch the end of the output. It now checks the routes itself:
+
+```
+==> routes the dashboard needs
+    /api/signals/live            200
+    /api/health                  200
+    /api/candles/B-BTC_USDT      200
+    /api/sources                 200
+```
+
+**All four must be 200.** A `404` there means that route is still not in the code — go back to Part
+A. The script will say so explicitly.
+
+If it prints **"already up to date"** *and* a route still 404s, the code did not reach GitHub. That
+is Part A again, not a VM problem. The script now says this too.
+
+### B2. Confirm the whole chain
+
+```bash
+bash /opt/crypto-trader/deploy/azure/diagnose.sh
+```
+
+There are two new sections:
+
+| Section | What it tells you |
 |---|---|
-| File ownership | `data/` and `logs/` both belong to `crypto` ✅ |
-| All services | running, **0 restarts** — no crash loop ✅ |
-| The engine | 401 without the token, 200 with it ✅ |
-| Price history | complete ✅ |
-| Disk | 8% used ✅ |
-| Errors in the last hour | **zero** ✅ |
+| **4b. Does this engine serve every route the dashboard needs?** | lists each route and its status. Any `404` means the VM is older than the dashboard |
+| **4c. Deployed version** | the exact commit the VM is running, and whether it is behind the remote |
 
-The engine was never the problem. Only the route from Vercel to it.
+**Section 4b is the one that was missing**, and it is why this took two rounds. All eight of your
+original sections asked "is the engine working". None asked "is the engine the version the dashboard
+expects".
 
 ---
 
-## Two more bugs I found while reading your logs
+# Part C — Redeploy Vercel
 
-Both were mine, both are fixed, and **one of them would have wasted your entire 72-hour run.**
+**Deployments** → the top one → the **⋯** menu → **Redeploy** → **Redeploy**.
 
-### 1. The dashboard would have frozen after one evaluation
+Change nothing in Settings. Your `CT_API_BASE` and `CT_API_TOKEN` are correct and always were.
 
-`python -m app --serve` evaluated **once**, then started the web server — and the web server never
-returns. So the engine would have produced one set of suggestions at startup and served that same
-frozen moment for three days. The only thing that would have moved on your dashboard is the "data
-age" counter climbing.
-
-It would have looked almost plausible, which is the worst kind of bug. **Fixed:** the web server now
-runs alongside a loop that keeps evaluating. I measured it — 6 evaluations in 75 seconds at a
-12-second interval, where before it was exactly 1.
-
-### 2. The health panel reported your database as broken when it wasn't
-
-A detail of how databases and threads interact: the health check was asking the *writing* connection
-a question from the *reading* side, which that kind of database refuses. So the dashboard would have
-shown your store as `DOWN` with a confusing message while the engine was writing perfectly well.
-
-**Fixed:** the health panel now checks the connection the dashboard actually reads through. After the
-fix it reports honestly — your store healthy, and the two known-degraded regime models flagged as
-degraded, which is true and expected.
+Wait two minutes, then open the dashboard. You should have three pages in the left menu:
+**Suggestions**, **Chart**, **Data**.
 
 ---
 
-## Step 1 — Get the fixed code
+# Part D — How to restart the whole project safely
 
-```bash
-ssh -i "C:\Users\dksma\Downloads\crypto-vm_key.pem" azureuser@20.193.148.146
-```
+Keep this. It is the answer to "something is stuck, how do I start clean".
 
-```bash
-cd /opt/crypto-trader
-sudo -u crypto git pull
-sudo -u crypto ./.venv/bin/pip install --quiet -e .
-```
-
----
-
-## Step 2 — Switch the engine to listen on the network
-
-Right now the engine only listens to itself, which is why it needed a tunnel. One line changes that.
-
-```bash
-sudo nano /etc/crypto-trader/env
-```
-
-Find this line:
-
-```
-CT_SERVER__HOST=127.0.0.1
-```
-
-Change it to:
-
-```
-CT_SERVER__HOST=0.0.0.0
-```
-
-`0.0.0.0` means "listen on the network card" instead of "only to myself". While you are in the file,
-also change this line to `false` (it was for the tunnel, which is going away):
-
-```
-CT_SERVER__PUBLIC_VIA_TUNNEL=false
-```
-
-Save and exit: `Ctrl+O`, `Enter`, `Ctrl+X`.
-
-> **The engine refuses to start on a network address without a token.** That is deliberate. You
-> already have a token set, so this will be fine — but it means there is no way to accidentally end
-> up with an open, password-free port.
-
----
-
-## Step 3 — Stop and remove the tunnel
-
-```bash
-sudo systemctl disable --now crypto-tunnel
-sudo rm -f /etc/systemd/system/crypto-tunnel.service /etc/crypto-trader/tunnel-env
-sudo systemctl daemon-reload
-```
-
-Then restart the engine so it picks up the new setting:
+### Normal restart (keeps all data)
 
 ```bash
 sudo systemctl restart crypto-ingest
 sudo systemctl restart crypto-app
-sleep 15
+sleep 5
 systemctl is-active crypto-ingest crypto-app
 ```
 
-You want **two lines saying `active`**.
+Expected: `active` twice. Nothing is lost — the database is on disk and both services pick up where
+they left off. **Safe to do any time.**
 
-Now confirm it is listening on the network rather than just to itself:
-
-```bash
-ss -ltn | grep 8000
-```
-
-You want to see **`0.0.0.0:8000`**. If it says `127.0.0.1:8000`, the setting didn't take — check
-Step 2 and restart `crypto-app` again.
-
-You can also delete the tunnel in the Cloudflare dashboard if you like. Nothing depends on it now.
-
----
-
-## Step 4 — Open the port in the Azure firewall
-
-1. [portal.azure.com](https://portal.azure.com) → your VM (`crypto-vm`) → **Networking** →
-   **Network settings**
-2. **Add inbound port rule**, and fill in exactly this:
-
-   | Field | Value |
-   |---|---|
-   | Source | **Any** |
-   | Source port ranges | `*` |
-   | Destination | **Any** |
-   | Service | **Custom** |
-   | Destination port ranges | `8000` |
-   | Protocol | **TCP** |
-   | Action | **Allow** |
-   | Priority | `110` |
-   | Name | `allow-api` |
-
-3. **Add**
-
-### Why "Any" is the source, and what that actually risks
-
-Vercel doesn't publish fixed addresses for its servers on the free plan, so the rule can't be
-narrowed to them. **The token is what protects the port.** Being precise about what that means:
-
-**What someone with a stolen token could do:** read public market prices, and read your suggestions.
-
-**What they could not do:**
-
-- **trade anything.** No code in this project can place, cancel or transfer — there is none, and a
-  test fails the build if an order or wallet address ever appears in it;
-- **steal a credential.** Your CoinDCX fields are empty, because everything this system reads is
-  public;
-- **burn your exchange rate limit.** The web API only reads your local database. It makes no calls
-  out to CoinDCX at all — that's the separate ingest service, on its own schedule.
-
-**The honest downside:** the traffic is plain HTTP, so the token crosses the internet unencrypted.
-Someone sitting on the network path could read it. For what's behind it, that is a fair trade — and
-the engine now logs a summary whenever requests arrive without a valid token, so you'd see it being
-probed. If you want it encrypted, there's an HTTPS upgrade at the end of `HOSTING.md`; it needs a
-free hostname and takes about 10 minutes.
-
----
-
-## Step 5 — Test it from your own PC
-
-**PowerShell on your laptop** — not the VM:
-
-```powershell
-curl.exe -s -o NUL -w "%{http_code}`n" http://20.193.148.146:8000/api/health
-```
-
-| Result | Meaning |
-|---|---|
-| **401** | Correct. Reachable, and refusing anyone without the token |
-| Hangs, then nothing | The firewall rule is missing or wrong — redo Step 4 |
-| **200** | **Stop and tell me.** That would mean the port is open with no password |
-
-**Do not go to Step 6 until you see 401.** Everything after this depends on it.
-
----
-
-## Step 6 — Point Vercel at the VM and redeploy
-
-1. **vercel.com** → your project → **Settings** → **Environment Variables**
-
-2. Change **`CT_API_BASE`** to exactly this:
-
-   ```
-   http://20.193.148.146:8000
-   ```
-
-   | | |
-   |---|---|
-   | ✅ Right | `http://20.193.148.146:8000` |
-   | ❌ `https` | `https://20.193.148.146:8000` — there is no certificate, this will fail |
-   | ❌ Trailing slash | `http://20.193.148.146:8000/` |
-   | ❌ A path on the end | `http://20.193.148.146:8000/api` |
-
-   **`http`, not `https`** — and that is not a security mistake on your part. Your browser still
-   loads the dashboard over HTTPS; only Vercel's *server* speaks plain HTTP to your VM, and browsers
-   don't care what a server does behind the scenes.
-
-3. Leave **`CT_API_TOKEN`** alone — it hasn't changed.
-
-4. **Redeploy. This is the step people miss.** Vercel does not apply a changed variable to a
-   deployment that already exists; the old value stays live until you build again.
-
-   **Deployments** → the top one → the **⋯** menu → **Redeploy** → **Redeploy**.
-
-Wait two minutes, then open your dashboard.
-
----
-
-## Step 7 — Confirm, then leave it alone
-
-On the VM:
+### Stop everything
 
 ```bash
-bash /opt/crypto-trader/deploy/azure/diagnose.sh
+sudo systemctl stop crypto-app crypto-ingest
 ```
 
-Section 5 is now about direct access rather than the tunnel, and tells you whether the port is
-genuinely listening on the network.
+While stopped, **Tier B data is being lost permanently** (funding, positioning, order book have no
+archive — see the Data page). Price candles will be refilled automatically on restart. So stop it
+for minutes, not days.
 
-Then **stop touching it for 72 hours.** That is the whole point of this exercise: finding out what
-breaks when nobody is watching, which is the only way to find that out.
+### Restart after a code change
 
-### Once a day, three commands
+Always `update.sh`, never a bare `systemctl restart` — the restart alone reloads the *same* code:
 
 ```bash
-# Still running, and not restarting?
-systemctl is-active crypto-ingest crypto-app
-systemctl show -p NRestarts --value crypto-app
+sudo bash /opt/crypto-trader/deploy/azure/update.sh
 ```
 
+### Start clean from scratch (deletes all collected data)
+
+Only if the database is genuinely broken. **Read the warning first.**
+
 ```bash
-# Anything gone wrong?
-journalctl -u crypto-app -u crypto-ingest --since '1 day ago' | grep '"level": *"error"' | tail -20
+sudo systemctl stop crypto-app crypto-ingest
+sudo -u crypto rm -f /opt/crypto-trader/data/state.db*
+sudo systemctl start crypto-ingest
+# watch it rebuild — it fetches ~17,500 bars in about 20 seconds
+journalctl -u crypto-ingest -f
+# when you see "history_filled" or "history_complete", press Ctrl-C and start the app
+sudo systemctl start crypto-app
 ```
 
-```bash
-# Price data still current? Should say 0 bars missing.
-cd /opt/crypto-trader && sudo -u crypto ./.venv/bin/python -m bootstrap --check | tail -3
-```
+> **What this costs.** Price candles come back automatically. **All Tier B history is gone for
+> good** — nobody can refetch yesterday's order book, with any API key, at any price. Every day the
+> system has been running is a day of Tier B history, and this throws it away.
 
-### What counts as a problem, and what doesn't
-
-| What you see | Is it a problem? |
-|---|---|
-| `No suggestions right now` | **No.** A quiet market is the normal state. Most hours have nothing to say |
-| The data age sitting at a few seconds and resetting | **No** — that is the fix from this round working |
-| A few `DQ_STALE` errors | **No.** A source was briefly late and the engine declined to guess |
-| A few `api_requests_refused` summaries | **No.** Background scanning of a public port. Normal |
-| A *rising* stream of `api_requests_refused` from one address | **Yes.** Someone is guessing tokens — rotate it (below) |
-| `NRestarts` climbing | **Yes.** `journalctl -u crypto-app -n 40 --no-pager` |
-| Data age climbing past 10 minutes and never resetting | **Yes.** The evaluation loop has stopped |
-| Disk above 85% | **Yes.** The database grows ~2 GB/month |
-
-### Rotating the token, if you ever need to
+### If a service will not stay up
 
 ```bash
-/opt/crypto-trader/.venv/bin/python -c "import secrets; print(secrets.token_urlsafe(48))"
-sudo nano /etc/crypto-trader/env     # paste it over CT_SERVER__AUTH_TOKEN
-sudo systemctl restart crypto-app
-```
-
-Then update `CT_API_TOKEN` in Vercel to match and **redeploy**.
-
----
-
-## Your CoinDCX API key — still don't add it
-
-Nothing has changed here. Leave it out:
-
-1. **Every piece of data this system reads is public.** We tested the one endpoint the vendor docs
-   claim needs a password — it returns everything to a plain, unauthenticated request.
-
-2. **It wouldn't give us the missing data anyway.** What we lack historically — funding rates,
-   positioning, the order book — isn't withheld behind a login. The exchange publishes no "give me
-   last year's funding rates" endpoint to *anyone*. A key cannot create history that was never
-   published. That data only accumulates from now on, while your engine runs.
-
-3. **An unused key can't leak.** Right now a complete compromise of your VM costs you nothing,
-   because there is nothing there to take. That is worth keeping.
-
-If you ever do need one, make a **fresh** key with trading and withdrawal **switched off**.
-
----
-
-## Two small housekeeping notes from your log
-
-**Your SSH stopped working for a while** because your home internet address changed
-(`106.192.48.69` → `106.222.206.143`) and the firewall rule still allowed the old one. You fixed it
-correctly. It will happen again whenever your router gets a new address — same fix: VM →
-**Networking** → the `SSH` rule → **Source** → **My IP address** → Save.
-
-**The VM says `*** System restart required ***`** from security updates. Worth doing before the
-72-hour run starts, so it doesn't interrupt it:
-
-```bash
-sudo apt-get update && sudo apt-get upgrade -y
-sudo reboot
-```
-
-Wait two minutes, reconnect, and confirm both services came back on their own:
-
-```bash
-systemctl is-active crypto-ingest crypto-app
-```
-
-Both should say `active` without you starting anything — that is what `enable` was for, and it's
-worth proving once.
-
----
-
-## The rules that keep this working
-
-**Every command touching `data` or `logs` starts with `sudo -u crypto`.** A permission error almost
-always means that prefix was missing.
-
-**Never run `chown` to fix a permission error here.** It looks like the fix and it's what broke the
-engine last time.
-
-**After changing anything in Vercel, redeploy.** Settings alone do nothing.
-
-**When something looks wrong, run `diagnose.sh` first.** It names the broken link instead of making
-you guess.
-
----
-
-## If you're still stuck
-
-Run these and send me everything:
-
-```bash
-bash /opt/crypto-trader/deploy/azure/diagnose.sh
-```
-
-```bash
+systemctl status crypto-app --no-pager | head -20
 journalctl -u crypto-app -n 60 --no-pager
 ```
 
-```bash
-ss -ltn | grep 8000
+Look at `NRestarts` in the status output. A climbing number is a crash loop — a crash loop still
+reports `active`, which is why that number matters.
+
+---
+
+# Why "the frontend is updated but gets no data from the VM"
+
+Worth understanding, because it will happen again otherwise. **They are two separate deployments
+that cannot see each other's version.**
+
+```
+your PC  ──git push──▶  GitHub  ──┬──▶ Vercel pulls automatically  (the dashboard)
+                                  └──▶ you run update.sh by hand   (the engine)
 ```
 
-And from your laptop, the result of the `curl.exe` command in Step 5. With those four I can tell you
-exactly where the chain is broken.
+Vercel redeploys itself on every push. **The VM does not.** So after a push you are always in a
+state where the dashboard is new and the engine is old, until you run `update.sh`. During that
+window, new pages 404 and new fields are missing — which is exactly what you were looking at.
+
+And if the push never happened, **both** sides are old, while `git status` on your PC is the only
+place that says so. Hence Part A.
+
+**The rule: `git push`, then `update.sh`, then redeploy Vercel. In that order, every time.**
+
+---
+
+# Reading the Data page
+
+Once everything is up, `/data` lists every source with its row count, when it last delivered, and
+the last value.
+
+| What to check | Healthy |
+|---|---|
+| "series behind" at the top | **0** |
+| each price series | `0 behind` and a sensible last close |
+| each point-in-time source, **"last hour"** | **greater than zero** |
+| data quality | "No data-quality events in 24 hours", or a few `ROWS_REJECTED` |
+
+**"last hour" is the useful column.** It is measured, not configured — so a source that should poll
+every 15 seconds but delivers nothing shows a red **0** there even though every service reports
+`active`. Nothing else on the dashboard can show you that.
+
+Two labels:
+
+- **Tier A — rebuildable.** Price candles, instrument metadata. Refetched automatically if lost.
+- **Tier B — no archive, gaps are permanent.** Funding, positioning, order book. These accumulate
+  only while the ingest service runs. This is the real reason to leave the VM on.
+
+One row says **"not collected by this system"** — tick-by-tick trades. That is correct, not a fault.
+
+---
+
+# The rules that keep this working
+
+| | |
+|---|---|
+| **`git push` → `update.sh` → redeploy Vercel** | In that order. Skipping the middle step is what caused this round |
+| **`git status` must say "working tree clean"** before you deploy | It is the only place that knows whether the code left your PC |
+| **Never commit `.env`** | Credentials live in `.env` on the VM and in Vercel's settings. Nowhere else |
+| **Never paste a key into a chat** | Including to me. Your CoinDCX key is still not needed — everything read here is public |
+| **`data/` is never pushed** | It holds the validation holdout. Note this is now `/data/` — the repo root only |
+| **The system never trades** | It has no order code, and a test greps the source to keep it that way |
+| **Never edit files directly on the VM** | The next `update.sh` refuses to overwrite them, and the update stops |
+
+---
+
+# If something is still wrong
+
+Send me:
+
+1. the output of `git status` **on your PC** (this is the one I did not ask for last time, and it
+   would have found the problem in a minute);
+2. sections **4b** and **4c** of `diagnose.sh`;
+3. a screenshot of the **Data** page.

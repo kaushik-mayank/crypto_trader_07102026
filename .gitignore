@@ -5,8 +5,15 @@
 
 # Recorded / backfilled data and logs. data/ holds the HOLDOUT (specs/09 §1.2), which must never
 # reach a shared repository where it could be inspected before Stage 10.
-data/
-logs/
+#
+# **Leading slash, and it matters.** A bare `data/` matches a directory named `data` at *any* depth,
+# so it silently excluded `frontend/app/data/` — the dashboard's Data page — and the commit that was
+# supposed to add that page added everything except it. Vercel then served a 404 for a route whose
+# source had never left the laptop, and nothing reported a problem, because an ignored file is not
+# an error (F-057). Anchored to the repository root, these still cover the holdout and the logs,
+# which are the only things they were ever meant to cover.
+/data/
+/logs/
 
 # Databases and derived columnar artifacts (specs/18 §1 pre-push checklist)
 *.db

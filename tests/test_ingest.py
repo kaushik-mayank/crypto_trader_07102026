@@ -467,3 +467,78 @@ def test_every_series_gets_a_sweep_task_below_the_live_polls_in_priority(store):
     assert {t.name for t in sweeps} == {"settle:futures:B-BTC_USDT:1h", "settle:futures:B-BTC_USDT:1m"}
     live = [t for t in tasks if t.name.startswith("candles:")]
     assert all(s.priority > min(t.priority for t in live) for s in sweeps)
+
+
+# ---- gap repair in the live path (F-049) ----------------------------------------------------
+
+def test_the_spot_poll_window_widens_to_cover_a_gap_instead_of_capping_at_30_bars(store,
+                                                                                  monkeypatch):
+    """The live poll is also the gap repair, and for spot it silently was not.
+
+    ``poll_candles`` requests from the newest stored bar to now, so after an outage the window spans
+    the hole and the venue fills it. The spot branch then capped the row count at
+    ``refetch * 4 + 10`` — 22 bars with this fixture's ``refetch_bars = 3`` — and spot candles
+    arrive **newest-first**, so a 100-hour outage got the newest 22 rows back and left the hole
+    untouched. Permanently: ``bootstrap`` rebuilds futures only, so nothing else would ever fetch
+    those hours.
+
+    Hand-computed: the newest stored bar opened 100 hours before "now", the window therefore starts
+    103 hours back (``latest - refetch * 1h``), and 103 hours plus the two partial bars at the ends
+    is 105 rows — well past the old cap of 22.
+    """
+    import time as _time
+
+    from normalize.canonical import Bar, Timeframe
+
+    captured: dict[str, object] = {}
+
+    # Aligned to a UTC hour boundary, because a bar that is not is a rejected bar.
+    this_hour = (int(_time.time() * 1000) // 3_600_000) * 3_600_000
+    latest = this_hour - 100 * 3_600_000
+    store.upsert_bars([Bar(asset="B-BTC_USDT", product=Product.SPOT, timeframe=Timeframe.H1,
+                           open_time_ms=latest, open="100", high="110", low="90", close="105",
+                           volume_base="1.5", is_final=True, fetched_at_ms=latest)])
+
+    pipeline = _pipeline(store, [])
+
+    def fake_spot_candles(client, **kwargs):
+        captured.update(kwargs)
+        raise AssertionError("stop here: only the request window is under test")
+
+    from ingest import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module.adapters, "spot_candles", fake_spot_candles)
+
+    with pytest.raises(AssertionError):
+        asyncio.run(pipeline.poll_candles("B-BTC_USDT", Product.SPOT, Timeframe.H1, "1h"))
+
+    # 105 hand-computed; 106 if the clock crosses an hour boundary between the bar being written
+    # and the window being built, which happens once an hour and is not a defect.
+    assert captured["limit"] in (105, 106), captured
+
+    # And a series that is already current still asks for a small window — the widening must be
+    # driven by the gap, not applied unconditionally. Asking for a thousand bars every minute
+    # would trade a data hole for a rate-limit problem.
+    store.upsert_bars([Bar(asset="B-BTC_USDT", product=Product.SPOT, timeframe=Timeframe.H1,
+                           open_time_ms=this_hour - 3_600_000, open="100", high="110", low="90",
+                           close="105", volume_base="1.5", is_final=True,
+                           fetched_at_ms=this_hour)])
+    with pytest.raises(AssertionError):
+        asyncio.run(pipeline.poll_candles("B-BTC_USDT", Product.SPOT, Timeframe.H1, "1h"))
+    assert captured["limit"] == 22, "a current series must not ask for a thousand bars every minute"
+
+
+def test_the_futures_poll_window_already_spans_a_gap_and_must_keep_doing_so():
+    """Futures takes no row cap at all, which is why gaps there have always self-healed. Asserted so
+    a future "tidy-up" that adds a limit does not quietly reintroduce the spot bug."""
+    import inspect
+
+    from ingest.pipeline import IngestPipeline
+
+    source = inspect.getsource(IngestPipeline.poll_candles)
+    futures_call = source.split("else:", 1)[1]
+    assert "limit=" not in futures_call.split("outcome")[0], (
+        "the futures candle request must stay uncapped, or an outage longer than the cap becomes a "
+        "permanent hole"
+    )
+

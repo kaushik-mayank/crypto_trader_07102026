@@ -406,7 +406,26 @@ curl.exe -s -o NUL -w "%{http_code}`n" http://YOUR_VM_IP:8000/api/health
    > apply a changed variable to a deployment that already exists — the old value stays live until
    > you trigger a new build. Deployments → the top one → **⋯** → **Redeploy**.
 
-5. Open it. You should see the dashboard, with a line at the top saying the system never trades.
+5. Open it. You should see the dashboard, with a line at the top saying the system never trades, and
+   a menu down the left with two pages.
+
+6. **Click "Chart" before you trust anything else.** This is the one page that shows the *data*
+   rather than a conclusion drawn from it. Pick BTC and the 1h interval:
+
+   | What to look at | Healthy |
+   |---|---|
+   | **newest bar** | under one interval old, **0 intervals behind** |
+   | **stored for this interval** | thousands |
+   | **awaiting confirmation** | 0, 1 or 2 |
+   | the candles | continuous, no holes, reaching the right-hand edge |
+
+   Hollow dashed candles at the right edge are normal — those bars have been fetched once and not
+   yet confirmed, and the engine deliberately will not compute on them. A **hole** in the candles is
+   a real outage during that period; the engine will not compute across it and says so rather than
+   guessing.
+
+   If the chart is empty or many intervals behind, the data is not arriving and no suggestion from
+   this system means anything. Go to Step 9 and run `diagnose.sh`.
 
 ---
 

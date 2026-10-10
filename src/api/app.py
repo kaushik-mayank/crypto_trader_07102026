@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from api.services import HealthService, MarketService, ServiceResult, SignalService
-from core.errors import ALL_ERRORS, ConfigError, StartupError
+from core.errors import ALL_ERRORS, BadRequest, ConfigError, StartupError
 from core.logging import get_logger
 
 log = get_logger("api.app")
@@ -118,7 +118,15 @@ def assert_bind_allowed(host: str, auth_token: str, *, public_via_tunnel: bool =
 
 def status_code_for(result: ServiceResult) -> int:
     """HTTP status from the envelope. A degraded system still answers 200 with its reasons — the
-    envelope carries the truth, and a 500 would hide a partially useful response."""
+    envelope carries the truth, and a 500 would hide a partially useful response.
+
+    ``BadRequest`` is the one error that is not 503. The caller asked for something that does not
+    exist — an interval this system never stores — and a 503 would say the engine is unavailable
+    when it is answering perfectly well. Monitoring that counts 503s would then record an outage
+    every time a chart requested a bad parameter.
+    """
+    if isinstance(result.error, BadRequest):
+        return 400
     if result.error is not None:
         return 503
     return 200
@@ -244,6 +252,26 @@ def create_app(*, signals: SignalService, market: MarketService, health: HealthS
     @app.get("/api/assets/{asset}/rejections")
     def rejections(asset: str) -> Any:
         return respond(market.rejections(asset))
+
+    @app.get("/api/candles/{asset}")
+    def candles_endpoint(asset: str, timeframe: str = "1h", limit: int = 500) -> Any:
+        """OHLCV for the chart.
+
+        The only endpoint taking parameters that shape the *response*, and they are deliberately
+        inert: ``timeframe`` is checked against a fixed set and ``limit`` is clamped, so neither can
+        reach a query unbounded. Nothing here touches the strategy or risk engines (specs/14 §11) —
+        this reads stored bars and nothing else.
+        """
+        return respond(market.candles(asset, timeframe=timeframe, limit=limit))
+
+    @app.get("/api/sources")
+    def sources() -> Any:
+        """What the system is actually fetching, with each source's newest row and last value.
+
+        Takes no parameters at all, which is deliberate: this is the endpoint someone opens when
+        they do not yet know what is wrong, so there is nothing to get wrong about the request.
+        """
+        return respond(market.sources())
 
     @app.get("/api/regime")
     def regime() -> Any:

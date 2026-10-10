@@ -1068,6 +1068,15 @@ against a fresh holdout; API-change drill.
 | **D-42** | The API reports **its own** read connection's health, never the writer's | `AppRunner.health(include_store=False)` for request threads. A sync FastAPI handler runs in a worker, so querying the writer's connection raised a cross-thread error and the dashboard showed the store `DOWN` while the engine wrote fine (F-043). It is also the better number: the writer being healthy says nothing about whether a request can read |
 | **D-43** | The Cloudflare tunnel is removed; the API is exposed directly behind its token | The owner could not get it working, and **an unmaintainable security control is not a security control**. The existing bind guard already made this safe — the app refuses to start on a non-loopback address without a token — so no new mechanism was needed. The cost is TLS: the token crosses the internet in clear. Acceptable here because the API reads only the local database, makes **no outbound calls**, holds no credential and cannot trade; the worst case of a stolen token is someone reading public prices (F-044). `HOSTING.md` documents the HTTPS upgrade for when that trade stops being acceptable |
 | **D-44** | Refused requests are counted and logged **in aggregate**, never one line each | Opening a port without noticing who knocks is careless; one line per refusal lets a scanner fill the disk, which is a denial of service handed over free. A summary every 50 also makes the distinction visible that matters — background scanning is a handful from many addresses, token-guessing is a rising count from one |
+| **D-45** | The dashboard proxy waits **20 s**, not 8 | The owner reported the dashboard flipping between connected and not connected while the engine was demonstrably healthy. A cold Vercel function plus a round trip to a B-series VM in another region can exceed 8 s with nothing wrong, so the timeout was manufacturing an outage. Still bounded: a dashboard that waits forever cannot be told apart from a dead engine, and the reader would assume the numbers on screen were current |
+| **D-46** | A caller asking for something that does not exist is `BadRequest` / **HTTP 400**, not `ServiceUnavailable` / 503 | The problem class is what tells the operator where to look, so getting it wrong wastes the most time at the worst moment. A chart requesting a `2h` interval this system never stores would have been reported `infrastructure` with a 503 — sending someone to check the VM, the firewall and the service logs for a mistake in a query string. It is also the only error in the API that is not 503, so monitoring that counts 503s no longer records an outage for a bad parameter |
+| **D-47** | The chart draws its own SVG; **no charting library** | A library would be fewer lines, but Node is not installed on the development machine, so its build cannot be verified here — and a chart that fails to compile on Vercel is worse than one written longhand. SVG also makes every candle a real DOM node, so the chart is inspectable and prints. Two properties it buys explicitly: candles positioned by **time** rather than index, so an outage leaves a visible hole instead of being closed up; and non-final bars drawn hollow, so a bar the feature layer refuses to compute on is never shown as settled |
+| **D-48** | Published levels are rounded to the instrument tick in `build_signal`, **not** at the display boundary and **not** in the risk engine | The risk engine computes `k_net`, the breakeven hit rate and the R:R gate from these numbers, so rounding later would show a reader a price the arithmetic never used — a trade displayed as clearing its R:R floor might not, by a tick, silently. Rounding in the risk engine was refused because it may veto but never alters what a strategy published. `build_signal` is the moment a strategy's arithmetic *becomes* a published level, and is one place rather than fourteen (F-054) |
+| **D-49** | `Levels.price_basis` is a field, not a sentence in `detail` | C1-C's payload has said "residual (spread) units, not price" since it was written, and the dashboard rendered `entry -0.0414` anyway for weeks. **Prose in a payload is advice; a field is a contract** — nothing can branch on a sentence. The same reasoning covers `pending_direction`, which C3-C already published and which was also ignored (F-051, F-053) |
+| **D-50** | The API lifts `detail` to the top level of each signal rather than leaving it nested in `payload` | Three readers, two got the nesting wrong: `render.py` read `payload["detail"]` correctly while the Vercel dashboard read `signal.detail` and therefore read `undefined` on **every display rule**, silently. A shape that one reader in three gets right is the wrong shape, so it is flattened at the source instead of corrected in each reader. `payload` is still published for the audit path (F-056) |
+| **D-51** | Ignore rules for the holdout are **anchored to the repository root** (`/data/`, not `data/`) | A bare `data/` matches a directory of that name at any depth, and silently excluded `frontend/app/data/` — so the commit that added the Data page added everything except it, through four stages that each reported success (F-057). The holdout is still covered, because it only ever lived at the root. A test now runs `git check-ignore` over every deployable file, because the next person to add a route called `data`, `logs`, `build` or `dist` will not be thinking about `.gitignore` |
+| **D-52** | Each side of the deployment must be able to **state its own version**, and one must check the other's | Two sessions were spent debugging a VM that was working correctly, because every diagnostic asked "is the engine healthy" and none asked "is the engine the version the dashboard expects" (F-059). `diagnose.sh` §4b probes the routes the dashboard calls and §4c prints the running commit; `update.sh` refuses to let "already up to date" read as success. More careful deployment instructions were not the answer — the drift is the default state of a two-sided deployment, so it has to be observable rather than avoided |
+| **D-53** | A display rule that depends on a **new** engine field also reads the old payload's evidence | The dashboard and the engine deploy separately, so a fix that needs both halves simultaneously is wrong for the entire window anyone is watching it — and stays wrong afterwards for every pre-upgrade row still in the signals table. `priceBasis()` prefers `price_basis` and falls back to `two_leg` / `levels_are`; `directionPending()` prefers `pending_direction` and falls back to `pending` / `entry_triggers` (F-058). The fallbacks are the case that actually occurs, not padding |
 | **D-16** | Every ruff ignore carries an inline reason | The ignores are deliberate patterns (long-lived recorder handles, pairwise `zip`, `Kind(str, Enum)`), not unfixed warnings. An unexplained ignore is indistinguishable from neglect |
 
 ---
@@ -1248,6 +1257,115 @@ per D-15 and un-ignored as later phases touch them.
 | `BUG_SOLVE.md` | Rewritten for round 2: the switchover, what the exposure costs, and the daily checks |
 | `tests/` | Five tests: a public bind without a token refuses to start, refusals are counted and summarised, `health` can omit the writer's store, the serve loop keeps evaluating, and it survives both a classified and an unclassified failure |
 | `docs/findings.md` | **F-043** (the frozen serve loop and the health thread bug), **F-044** (removing the tunnel, and what the exposure does and does not risk) |
+
+### The chart page, and five dashboard defects (2026-10-10)
+
+**Why this session exists.** The owner could not tell from the dashboard whether data was arriving.
+That turned out to be literally true rather than a matter of presentation: the dashboard's default
+for anything it did not recognise was *everything is fine*. Five defects, four of them mine, all in
+the layer between the engine and the reader — the engine itself was healthy throughout.
+
+| Path | Change |
+|---|---|
+| `frontend/app/chart/page.tsx` | **New** — the Chart page. BTC/ETH/SOL and 1m/15m/1h/4h/1d, live at 15 s, with the freshness envelope, `drawn` vs `stored_total`, `pending_confirmation`, and four distinct failure states (unreachable / wrong shape / warming / genuinely empty) |
+| `frontend/components/CandleChart.tsx` | **New** — SVG candlesticks, no charting library (D-47). Positioned by **time**, so a gap stays a gap; non-final bars hollow and dashed; non-finite prices dropped and **counted on screen**; crosshair with OHLCV |
+| `frontend/components/Nav.tsx` | **New** — the left-hand page nav. Active state marked by border and weight, not colour alone |
+| `frontend/app/layout.tsx`, `app/globals.css` | The shell: nav + content, `min-width: 0` so a wide chart cannot push the nav off, segmented controls, and a 720 px breakpoint that moves the nav on top |
+| `frontend/lib/honesty.ts` | `panelState` **requires a freshness envelope** (F-050). A JSON object without one is `down`, not `ready` |
+| `frontend/lib/api.ts` | An unparseable body is a **transport failure** naming the HTTP status, not a null payload (F-047). Added `candles()` |
+| `frontend/app/page.tsx` | The signal accessor fixed and guarded (F-048); `HealthSection` classifies the health reading into four outcomes before rendering it (F-047) |
+| `frontend/components/Panels.tsx` | `HealthPanel` separates three nothings — no payload, wrong shape, empty list — each with its own remediation (F-047) |
+| `frontend/app/api/proxy/[...path]/route.ts` | Wraps a non-2xx body that is not one of the engine's own errors, naming the status, the path and the first 200 bytes (F-050). `api/candles/` allow-listed. Timeout 8 s → **20 s** (D-45) |
+| `src/api/services.py` | `MarketService.candles()`; `SignalService.live()` falls back to the newest stored bar's close and reports `freshness_basis` (F-045) |
+| `src/api/app.py` | `GET /api/candles/{asset}`; `status_code_for` returns **400** for `BadRequest` (D-46) |
+| `src/core/errors.py` | Added `BadRequest` (`configuration`) — a caller asking for an interval that does not exist is not an outage (D-46) |
+| `src/ingest/pipeline.py` | The spot poll's row cap is derived from the span requested, so a gap wider than 30 bars is repaired instead of being permanent (F-049) |
+| `src/ingest/__main__.py` | `_fill_history()` runs the idempotent bootstrap plan at startup (F-046) |
+| `src/snapshot/request.py` | **New** — `build_request()` centralised, so ingest and bootstrap no longer import the API app to find out what to fetch |
+| `BUG_SOLVE.md` | Rewritten for round 3: what the calm screen actually meant, the `CT_API_BASE` check, the Chart page as the data check, and the five-step escalation |
+| `tests/` | 25 tests: ten on `/api/candles` (ordering, decimal strings, non-final flagging, close-based age, clamping, empty, HTTP, 400), three on the freshness fallback, two on spot gap repair, and ten contract tests reading the TypeScript as text |
+| `docs/findings.md` | **F-045** … **F-050** |
+
+**Answering the owner's two direct questions.**
+
+1. *Does it fetch missing history by itself, or must a command be run?* **By itself, no command.**
+   Verified: empty database → `history_incomplete missing_bars=17580` → `history_filled requests=15`
+   in ~20 s → second run `history_complete` with no requests. Wipe `data/state.db`, restart
+   `crypto-ingest`, and recent history rebuilds and then stays current.
+2. *Is "sometimes connected, sometimes not" an error?* **It was real and it was not the VM.** An 8 s
+   proxy timeout could not cover a cold Vercel function plus a round trip to a B-series VM in another
+   region, so a healthy engine read as intermittent. Now 20 s — still bounded, because a dashboard
+   that waits forever cannot be distinguished from a dead engine.
+
+**What is still not fixed, and cannot be here.** Node is not installed on the development machine, so
+the TypeScript cannot be compiled or executed. The contract tests read it as text — they catch an
+accessor or threshold diverging from the Python, not a type error. **The first Vercel build is still
+where a TypeScript mistake would surface.** This is the one standing limitation of the frontend work
+and it has now caused one real defect (F-048).
+
+### The data page, and six display defects (2026-10-11)
+
+**The engine was right about everything and the dashboard was wrong about most of it.** Every defect
+this round sat in the boundary between a correct payload and a renderer that assumed its shape. The
+engine had published `price_basis`, `pending_direction`, `execution_note` and a leg table; the
+dashboard read none of them, and showed a spread as a price, a placeholder as a recommendation, and a
+healthy feed as too stale to trade.
+
+| Path | Change |
+|---|---|
+| `frontend/app/data/page.tsx` | **New** — the Data page: every source, its row count, when it last delivered and the last value it delivered. Series lateness in **intervals**, Tier A/B permanence stated per source, data-quality counts on the same screen because fresh is not correct |
+| `src/api/services.py` | `MarketService.sources()` — series enumerated **from the data** so a series we think we record but do not is simply absent; `rows_last_hour` **measured, not configured**; per-source error isolation; `dq` events by kind. `SignalService.live()` publishes `market_data` separately (F-052). `_row_to_signal` lifts `detail` to the top level (F-056) |
+| `src/api/app.py` | `GET /api/sources`, which takes **no parameters at all** — it is what someone opens before they know what is wrong |
+| `src/strategy/evaluation.py` | `Levels.price_basis`; `publishable_levels()` rounds published levels to the instrument's tick at the moment they become published, before the risk engine computes `k_net` from them (F-054, D-48) |
+| `src/features/convert.py` | `quantize_price()` — the rounding rule on a Decimal, with `to_price` delegating, so specs/08 §10 has one implementation and no float round-trip |
+| `src/strategy/c1c_relative.py` | Declares `price_basis=RESIDUAL_BASIS`. Its `detail` had said so in prose since it was written and was ignored for weeks — prose is advice, a field is a contract (F-051) |
+| `frontend/components/Panels.tsx` | `SignalCard` renders a pending setup as **DIRECTION NOT YET DECIDED** with the level it watches, and a spread as its **leg table** with the levels row suppressed; `ExposureStrip` counts directional, spread and pending separately; `ActionBar` refuses `at —` (F-051, F-053) |
+| `frontend/lib/honesty.ts` | `signalDetail()` — one accessor, with a `payload.detail` fallback for an engine a few commits behind (F-056) |
+| `frontend/app/page.tsx` | Three ages, each labelled for what it is, with only market data judged against the staleness thresholds (F-052) |
+| `frontend/app/api/proxy/[...path]/route.ts` | The 404 message leads with **version skew** and states the discriminator; `api/sources` allow-listed (F-055) |
+| `frontend/components/Nav.tsx`, `app/globals.css` | The Data page in the nav; dense `.data-table` styles |
+| `src/api/render.py` | The **same** two fixes on the VM's own dashboard: a pending setup renders as "direction not yet decided", a spread renders its legs with no `entry` heading, the action bar refuses an undecided entry, and the exposure strip counts directional only. Both dashboards claim the same specs/15 rules, so a fix in one is half a fix |
+| `tests/` | 34 tests: eight on tick rounding (hand-computed in both directions, residual skipped, missing metadata not guessed), nine on `/api/sources`, two on the freshness split, ten contract tests on the display rules |
+| `docs/findings.md` | **F-051** … **F-056** |
+
+**What was actually wrong with the screen the owner sent.**
+
+| Symptom | Cause | Status |
+|---|---|---|
+| `entry -0.0414` on a LONG | C1-C's levels are a beta-adjusted spread, rendered as a price | fixed (F-051) |
+| `stop 83287.42500000000160` | specs/08 §10's tick rounding was implemented and had no callers | fixed (F-054) |
+| `C3-C LONG` with `entry —` | a structural placeholder direction rendered as a recommendation | fixed (F-053) |
+| "long 5, short 4", concentration warning | pending and market-neutral signals counted as directional | fixed (F-053) |
+| "market data 12m ago — too old to act on" | the newest *setup's* age judged against a *feed's* thresholds | fixed (F-052) |
+| chart page 404 | **the VM is running an older engine** — not `CT_API_BASE`, which was correct | needs `update.sh` on the VM; the message now says so (F-055) |
+
+**The one thing the owner must do:** `sudo bash /opt/crypto-trader/deploy/azure/update.sh`. The 404
+is version skew, and no change here can fix an engine that does not have the route yet.
+
+### Deployment, and why two sessions of it debugged the wrong machine (2026-10-11)
+
+**Nothing was wrong with the VM.** `diagnose.sh` reported OK on all eight sections and was correct;
+the engine code had never been committed. Two commits had been made and both contained only
+`frontend/` files, so `update.sh` was fetching a branch without the routes, reporting "already up to
+date", and restarting the same code. I gave that instruction twice without checking what it pulls.
+
+| Path | Change |
+|---|---|
+| `.gitignore` | `data/` → **`/data/`** and `logs/` → `/logs/`. The unanchored rule matched `frontend/app/data/`, so the Data page could never be committed and Vercel served a 404 for a route whose source had never left the laptop (F-057) |
+| `deploy/azure/diagnose.sh` | **§4b** asks the running engine which routes it serves, and **§4c** prints its commit and distance from the remote. Every existing section asked "is the engine working"; none asked "is it the version the dashboard expects" (F-059) |
+| `deploy/azure/update.sh` | "already up to date" no longer reads as success — it says that means nothing has been *pushed*; after restarting it probes the dashboard's routes and names any that 404 |
+| `frontend/lib/honesty.ts` | `priceBasis()` and `directionPending()` — one decision each, with fallbacks to what an **older** engine already publishes (`two_leg`, `levels_are`, `pending`, `entry_triggers`). Without them the F-051/F-053 fixes are wrong for the whole period the two sides are out of step, and for every pre-upgrade row still in the signals table (F-058) |
+| `src/api/render.py` | The same two helpers and the same fallbacks, so the dashboards cannot disagree about one signal |
+| `frontend/components/Panels.tsx` | Reads both through the helpers rather than the raw fields |
+| `BUG_SOLVE.md` | Rewritten round 5: **Part A is the push procedure**, which every previous round assumed and none explained; Part D is safe restart, clean-slate rebuild and what each costs |
+| `tests/` | 9 tests: `git check-ignore` over every deployable file (proven to catch the original bug by restoring the old pattern), the holdout still ignored, the old-engine fallbacks on both dashboards, and the two deploy scripts' new checks |
+| `docs/findings.md` | **F-057**, **F-058**, **F-059** |
+
+**The standing lesson.** A two-sided deployment drifts apart by default and neither side can see the
+other's version, so every symptom of the drift looks like a configuration problem on whichever side
+is being looked at. The answer is not more careful instructions — it is each side being able to
+state its own version, and one of them checking the other's.
+
 
 ## Next Action
 

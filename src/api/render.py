@@ -86,19 +86,77 @@ def render_envelope(result: ServiceResult) -> str:
             f'<span class="age">{age_text(env.age_seconds)}</span></div>')
 
 
+def _signal_detail(signal: dict[str, Any]) -> dict[str, Any]:
+    """A signal's ``detail``, from wherever it is.
+
+    The API lifts it to the top level (D-50); the ``payload`` fallback covers a row read straight
+    from the store by a caller that did not go through the service layer.
+    """
+    detail = signal.get("detail") or (signal.get("payload") or {}).get("detail") or {}
+    return detail if isinstance(detail, dict) else {}
+
+
+def _is_pending(signal: dict[str, Any]) -> bool:
+    """True when the direction is a placeholder, not a recommendation.
+
+    The fallbacks read a signal written by an **older** engine, which is the case that actually
+    occurs: this dashboard reads rows the running engine wrote, and after an upgrade the table still
+    holds setups armed by the previous version. Without them a placeholder direction keeps being
+    rendered as a recommendation until every pre-upgrade setup has expired (F-058).
+    """
+    detail = _signal_detail(signal)
+    if detail.get("pending_direction") is True or detail.get("pending") is True:
+        return True
+    triggers = detail.get("entry_triggers")
+    return (isinstance(triggers, (list, tuple)) and len(triggers) > 1
+            and signal.get("entry") is None)
+
+
+def _price_basis(signal: dict[str, Any]) -> str:
+    """The space the levels live in: ``price``, or something that is **not** a price."""
+    detail = _signal_detail(signal)
+    if detail.get("price_basis"):
+        return str(detail["price_basis"])
+    if detail.get("two_leg") is True:
+        return "residual"
+    levels_are = detail.get("levels_are")
+    if isinstance(levels_are, str) and "residual" in levels_are:
+        return "residual"
+    return "price"
+
+
+def _is_spread(signal: dict[str, Any]) -> bool:
+    """True when the levels are a spread rather than a price, so they are not tradeable numbers."""
+    return _price_basis(signal) != "price"
+
+
 def render_signal_card(signal: dict[str, Any]) -> str:
     """One card. ``ENTER_NOW`` cards are rendered by :func:`render_action_bar` instead."""
     payload = signal.get("payload") or {}
     raw = payload.get("raw") or {}
-    direction = raw.get("direction", signal.get("direction", ""))
+    detail = _signal_detail(signal)
     validated = bool(signal.get("validated"))
-    classes = ["card", f"dir-{_esc(direction).lower()}"]
+
+    # The same two things the Vercel card was getting wrong, and this card was getting wrong
+    # identically — both dashboards claim the same honesty rules, so a fix in one is half a fix
+    # (F-051, F-053).
+    #
+    # `pending_direction`: C3-A and C3-C arm without a direction and let the market assign it. The
+    # stored `direction` is a structural placeholder, and printing it states a recommendation the
+    # strategy explicitly refuses to make.
+    #
+    # `price_basis`: C1-C's levels are a beta-adjusted spread, negative about half the time. Under a
+    # heading marked *entry* they are a price that exists on no exchange.
+    pending = _is_pending(signal)
+    basis = _price_basis(signal)
+    direction = ("resolution pending" if pending
+                 else raw.get("direction", signal.get("direction", "")))
+    classes = ["card", "dir-pending" if pending else f"dir-{_esc(direction).lower()}"]
     if not validated:
         classes.append("unvalidated")
 
-    k_net = signal.get("k_net") or (payload.get("detail") or {}).get("k_net")
-    breakeven = signal.get("breakeven_hit_rate") or (payload.get("detail") or {}).get(
-        "breakeven_hit_rate")
+    k_net = signal.get("k_net") or detail.get("k_net")
+    breakeven = signal.get("breakeven_hit_rate") or detail.get("breakeven_hit_rate")
 
     # specs/15 §7: confidence is never blank and never a dash. The breakeven hit rate is the honest,
     # computable substitute, and it is labelled as such.
@@ -108,11 +166,33 @@ def render_signal_card(signal: dict[str, Any]) -> str:
                      if breakeven else "")
                   + "</div>")
 
-    levels = "".join(
-        f'<div class="level"><span>{label}</span><span>{_esc(value)}</span></div>'
-        for label, value in (("entry", signal.get("entry")), ("stop", signal.get("stop")),
-                             ("target", (signal.get("targets") or [None])[0]))
-        if value is not None)
+    if pending:
+        # No levels, and a sentence instead. There is nothing to place yet, and an empty levels
+        # block would read as "levels unknown" rather than "not decided".
+        levels = ('<div class="pending">direction not yet decided: this setup is watching '
+                  f'{_esc(detail.get("boundary") or "a level")} and trades whichever way it '
+                  'resolves</div>')
+    elif basis != "price":
+        # The levels are shown, but not as entry/stop/target, and the legs are what to place.
+        legs = "".join(
+            f'<div class="level"><span>{_esc(leg.get("asset"))} '
+            f'{_esc(str(leg.get("direction", "")).upper())}</span>'
+            f'<span>{_esc(leg.get("price"))} x{_esc(leg.get("notional_weight"))}</span></div>'
+            for leg in (detail.get("legs") or ()) if isinstance(leg, dict))
+        levels = (f'<div class="spread-note">two-leg spread trade: levels below are in {_esc(basis)} '
+                  'units and are <strong>not prices</strong>. Place the legs, both together.</div>'
+                  + (legs or '<div class="level"><span>legs</span><span>not published — '
+                             'report this</span></div>')
+                  + f'<div class="level muted"><span>{_esc(basis)} entry</span>'
+                    f'<span>{_esc(signal.get("entry"))}</span></div>'
+                    f'<div class="level muted"><span>{_esc(basis)} stop</span>'
+                    f'<span>{_esc(signal.get("stop"))}</span></div>')
+    else:
+        levels = "".join(
+            f'<div class="level"><span>{label}</span><span>{_esc(value)}</span></div>'
+            for label, value in (("entry", signal.get("entry")), ("stop", signal.get("stop")),
+                                 ("target", (signal.get("targets") or [None])[0]))
+            if value is not None)
 
     rationale = _esc(raw.get("rationale", ""))[:400]
     return (
@@ -137,7 +217,9 @@ def render_action_bar(signals: list[dict[str, Any]]) -> str:
     Three independent cues before colour: **position** (top of the page), **size** (display type) and
     **the word "enter"**. When empty it says so — a blank region reads as broken.
     """
-    live = [s for s in signals if s.get("state") == "ENTER_NOW"]
+    # A pending-direction setup is excluded: "ENTER BTC LONG —" is an instruction nobody can follow,
+    # assembled from a placeholder direction and a level that does not exist yet (F-053).
+    live = [s for s in signals if s.get("state") == "ENTER_NOW" and not _is_pending(s)]
     waiting = [s for s in signals if s.get("state") == "SETUP_DETECTED"]
     if not live:
         return (f'<section class="action-bar empty"><p>no entries live — '
@@ -146,7 +228,9 @@ def render_action_bar(signals: list[dict[str, Any]]) -> str:
         f'<div class="enter-card"><span class="word">ENTER</span>'
         f'<span class="asset">{_esc(s.get("asset"))}</span>'
         f'<span class="direction">{_esc(s.get("direction"))}</span>'
-        f'<span class="trigger">{_esc(s.get("entry"))}</span>'
+        f'<span class="trigger">'
+        + ("two-leg spread — see the card" if _is_spread(s) else _esc(s.get("entry")))
+        + '</span>'
         f'<span class="strategy">{_esc(s.get("strategy_id"))}</span></div>'
         for s in live)
     return f'<section class="action-bar live">{cards}</section>'
@@ -155,8 +239,12 @@ def render_action_bar(signals: list[dict[str, Any]]) -> str:
 def render_exposure_strip(signals: list[dict[str, Any]]) -> str:
     """The one place the dashboard editorialises, and it does so because the alternative — three
     identical cards implying three independent opportunities — is actively misleading (specs/15 §8)."""
-    longs = [s for s in signals if s.get("direction") == "LONG"]
-    shorts = [s for s in signals if s.get("direction") == "SHORT"]
+    # Directional only. Counting pending setups (which have no direction) and beta-neutral spreads
+    # (which are the opposite of concentrated directional risk) inflated this warning with exactly
+    # the signals that add no directional exposure (F-053).
+    directional = [s for s in signals if not _is_pending(s) and not _is_spread(s)]
+    longs = [s for s in directional if s.get("direction") == "LONG"]
+    shorts = [s for s in directional if s.get("direction") == "SHORT"]
     dominant = longs if len(longs) >= len(shorts) else shorts
     assets = sorted({str(s.get("asset")) for s in dominant if s.get("asset")})
     line = f'{len(longs)} long · {len(shorts)} short'
@@ -257,6 +345,13 @@ body { background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, sans
         padding: 1rem; margin: 1rem; }
 .card.unvalidated { border-style: dashed; opacity: .85; }
 .card .confidence .muted { color: var(--muted); }
+/* A setup with no direction yet, and a spread whose levels are not prices. Both are marked in
+   words as well as colour — the words are the cue that survives a monochrome print or a reader who
+   cannot distinguish the palette. */
+.card.dir-pending { border-left: 3px solid var(--act); }
+.pending { color: var(--act); margin: .5rem 0; }
+.spread-note { color: var(--act); margin: .5rem 0; }
+.level.muted span { color: var(--muted); }
 .not-backtested { color: var(--muted); margin-top: .5rem; font-size: .9em; }
 .panel.empty { padding: .5rem 1rem; color: var(--muted); }
 .signals.blind { padding: 1rem; color: var(--down); }

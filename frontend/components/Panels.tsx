@@ -7,7 +7,7 @@
  * small on purpose: all the judgement lives in `lib/honesty.ts` and in the engine's own payload, so
  * these are renderers, not deciders.
  */
-import { ageState, ageText, concentrationNotice, confidenceCopy, displayable, signalDetail, validationNotice, type PanelState } from '@/lib/honesty';
+import { ageState, ageText, concentrationNotice, confidenceCopy, directionPending, displayable, priceBasis, signalDetail, validationNotice, type PanelState } from '@/lib/honesty';
 
 /** Age, always as text and colour together — never colour alone. */
 export function Freshness({ ageSeconds, label = 'data' }: { ageSeconds?: number | null; label?: string }) {
@@ -79,14 +79,20 @@ export function Empty({ reason }: { reason: string }) {
 
 type Signal = Record<string, any>;
 
-/** True when the engine says this signal has no direction yet (C3-A, C3-C arm pending). */
+/**
+ * True when the engine says this signal has no direction yet (C3-A, C3-C arm pending).
+ *
+ * Via `lib/honesty.ts` so the older-engine fallbacks apply here too: while the VM lags behind this
+ * deployment, `pending_direction` is absent and a placeholder direction would be rendered as a
+ * recommendation exactly as before the fix (F-058).
+ */
 function isPending(s: Signal): boolean {
-  return signalDetail(s).pending_direction === true;
+  return directionPending(s);
 }
 
 /** True when the signal's levels are a spread rather than a price (C1-C). */
 function isSpread(s: Signal): boolean {
-  return String(signalDetail(s).price_basis ?? 'price') !== 'price';
+  return priceBasis(s) !== 'price';
 }
 
 /** specs/15: ENTER_NOW is relocated to the top, with three independent cues before colour. */
@@ -131,8 +137,8 @@ export function SignalCard({ signal }: { signal: Signal }) {
   // `price_basis` — C1-C's levels are a beta-adjusted spread, not a price, and are negative about
   // half the time. Rendered under a heading marked *entry* they are a price that exists nowhere
   // (F-051).
-  const pendingDirection = detail.pending_direction === true;
-  const basis = String(detail.price_basis ?? 'price');
+  const pendingDirection = directionPending(signal);
+  const basis = priceBasis(signal);
   const isPrice = basis === 'price';
   const legs: any[] = Array.isArray(detail.legs) ? detail.legs : [];
 

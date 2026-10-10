@@ -50,6 +50,11 @@ from normalize.errors import Accepted, Partial
 log = get_logger("bootstrap.fetch")
 COMPONENT = "bootstrap.fetch"
 
+#: Requests per second per host during a historical fill. The venue advertised 5,000 per 60 s on
+#: api.coindcx.com and did not throttle up to 10/s (F-022), so 5/s is about 6% of the advertised
+#: budget — deliberately polite, because a fill competes with live polling for the same budget.
+DEFAULT_RATE = 5.0
+
 #: Bars per request. The futures endpoint truncates silently past ~30,000 (F-009), so this stays
 #: well below it — the same 10,000 the verified Phase-1 backfill uses.
 CHUNK_BARS = 10_000

@@ -23,12 +23,13 @@ import numpy as np
 
 from core.errors import ConfigError, FeatureNotAvailable, SetupNotReady
 from core.logging import get_logger
+from features.convert import RoundMode, quantize_price
 from features.f2_volatility import true_range
 from features.value import FeatureSet, FeatureStatus
 from features.windows import extract
 from normalize.canonical import Product, Timeframe
 from regime.model import RegimeState
-from snapshot.models import MarketSnapshot, SeriesKey
+from snapshot.models import InstrumentKey, MarketSnapshot, SeriesKey
 from strategy.act import ActState, Direction, act
 from strategy.base import Lifecycle, RawSignal, SetupState
 from strategy.conditions import ConditionResult
@@ -42,6 +43,12 @@ CONFIRM_TF = Timeframe.M1
 TRIGGER_TF = Timeframe.M15
 
 
+#: What `Levels.price_basis` may say. A basis other than ``price`` means these numbers are **not**
+#: tradeable prices, so they are neither tick-rounded nor rendered as an entry anyone could place.
+PRICE_BASIS = "price"
+RESIDUAL_BASIS = "residual"
+
+
 @dataclass(frozen=True)
 class Levels:
     """What a strategy publishes. Immutable; the risk engine may veto but never alters these."""
@@ -50,6 +57,12 @@ class Levels:
     stop: Decimal | None
     targets: tuple[Decimal, ...] = ()
     detail: dict[str, Any] | None = None
+    #: The space these numbers live in. ``price`` for almost everything; ``residual`` for C1-C,
+    #: whose observable is a beta-adjusted spread and whose levels are therefore small and routinely
+    #: **negative**. Published because a consumer cannot tell the difference by looking: a dashboard
+    #: that renders a residual of ``-0.0414`` under a heading marked *entry* has invented a price
+    #: that does not exist, and a reader who acts on it is acting on nothing (F-051).
+    price_basis: str = PRICE_BASIS
 
 
 def signal_id(strategy_id: str, asset: str, armed_at_ms: int, snapshot_id: str) -> str:
@@ -156,20 +169,69 @@ def build_signal(*, strategy: Any, features: FeatureSet, snapshot: MarketSnapsho
     Every field here is what makes a signal replayable: the snapshot it was built from, the parameter
     hash, the code version and the strategy version. A signal without them cannot be audited, and
     specs/10 §8 treats that as unacceptable output.
+
+    This is also where levels are **rounded to the instrument's tick** (specs/08 §10), because this
+    is the moment a strategy's arithmetic becomes a published number. See :func:`publishable_levels`.
     """
+    priced = publishable_levels(levels, snapshot=snapshot, features=features, direction=direction)
     return RawSignal(
         signal_id=state.signal_id, strategy_id=strategy.id, strategy_version=strategy.version,
         asset=features.asset, product=features.product, direction=direction, lifecycle=lifecycle,
         as_of_ms=snapshot.as_of_ms, signal_timeframe=strategy.signal_timeframe,
-        entry=levels.entry, stop=levels.stop, targets=levels.targets, act=act_state,
+        entry=priced.entry, stop=priced.stop, targets=priced.targets, act=act_state,
         conditions=conditions, rationale=rationale, snapshot_id=snapshot.snapshot_id,
         parameter_hash=snapshot.parameter_hash, code_version=snapshot.code_version,
         regime=regime.to_dict(),
-        detail={**(levels.detail or {}), **(detail or {}),
+        detail={**(priced.detail or {}), **(detail or {}),
                 "tier": strategy.tier,
+                "price_basis": priced.price_basis,
                 "validated": False,          # nothing is validated until Phase 16 says so
                 "expansion_seeking": strategy.expansion_seeking},
     )
+
+
+def publishable_levels(levels: Levels, *, snapshot: MarketSnapshot, features: FeatureSet,
+                       direction: Direction) -> Levels:
+    """Round published levels to the instrument's tick, erring conservatively (specs/08 §10).
+
+    **Why this has to happen before the risk engine sees them, not at the display boundary.** The
+    risk engine computes `k_net`, the breakeven hit rate and the R:R gate *from these numbers*. Round
+    them later and the reader sees a price that is not the one the arithmetic used, so a trade
+    displayed as clearing its R:R floor may not — the two would disagree by a tick, silently, in the
+    direction nobody checked. Rounding here means the number on screen, the number in the audit
+    record and the number the cost model used are the same number.
+
+    The direction of rounding is not cosmetic. A stop rounds **away** from entry and a target
+    **toward** it, so tick rounding can only ever make a suggestion more conservative. Rounding to
+    nearest would let it flatter the trade by half a tick on both ends.
+
+    Three cases decline to round, each for its own reason:
+
+    * ``price_basis != "price"`` — the numbers are not prices. A residual has no tick (F-051).
+    * no instrument metadata — the tick is unknown, and **inventing one is forbidden** (invariant 1).
+      The risk engine already vetoes this signal on ``DQ_META``, so returning it unrounded loses
+      nothing: it cannot be acted on either way.
+    * ``tick <= 0`` — defaulted rather than fetched metadata, which must not be trusted.
+    """
+    if levels.price_basis != PRICE_BASIS:
+        return levels
+    meta = snapshot.instruments.get(InstrumentKey(features.asset, features.product))
+    tick = getattr(meta, "tick", None) if meta is not None else None
+    if tick is None or tick <= 0:
+        return levels
+
+    long_side = direction is Direction.LONG
+    entry = (quantize_price(levels.entry, tick=tick, mode=RoundMode.NEAREST)
+             if levels.entry is not None else None)
+    stop = (quantize_price(levels.stop, tick=tick,
+                           mode=RoundMode.STOP_LONG if long_side else RoundMode.STOP_SHORT)
+            if levels.stop is not None else None)
+    targets = tuple(
+        quantize_price(t, tick=tick,
+                       mode=RoundMode.TARGET_LONG if long_side else RoundMode.TARGET_SHORT)
+        for t in levels.targets)
+    return Levels(entry=entry, stop=stop, targets=targets, detail=levels.detail,
+                  price_basis=levels.price_basis)
 
 
 def update_trail(state: SetupState, *, atr: Decimal, s: Decimal, price: Decimal) -> None:

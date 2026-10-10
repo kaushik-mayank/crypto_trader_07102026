@@ -64,6 +64,43 @@ def closes_to_array(values: list[Decimal]) -> np.ndarray:
     return np.fromiter((to_float(v) for v in values), dtype=np.float64, count=len(values))
 
 
+def quantize_price(value: Decimal, *, tick: Decimal, mode: RoundMode) -> Decimal:
+    """Round a `Decimal` to the instrument's tick, in the direction ``mode`` requires.
+
+    The rounding rule itself lives **here only**, and :func:`to_price` delegates to it, so there is
+    one implementation of specs/08 §10 regardless of whether the caller arrived with a float from
+    the feature layer or a Decimal from a strategy's own arithmetic.
+
+    ``tick`` comes from live instrument metadata (invariant 1) — never a constant.
+    """
+    if tick <= 0:
+        raise UnitError(
+            f"tick size must be positive, got {tick}",
+            component=COMPONENT, operation="quantize_price",
+            context={"tick": str(tick)},
+            likely_cause="instrument metadata was defaulted instead of fetched",
+            remediation="fetch markets_details for this instrument; tick size is never assumed",
+        )
+    if not value.is_finite():
+        raise FeatureError(
+            f"refusing to publish a non-finite price ({value})",
+            component=COMPONENT, operation="quantize_price",
+            context={"value": str(value), "mode": mode.value},
+            likely_cause="a degenerate computation produced inf/nan and was not caught by its guard",
+            remediation="the computation that produced this must decline instead of publishing",
+        )
+    with localcontext() as ctx:
+        ctx.prec = 38
+        steps = value / tick
+        if mode in (RoundMode.STOP_LONG, RoundMode.TARGET_LONG):
+            n = steps.to_integral_value(rounding="ROUND_FLOOR")
+        elif mode in (RoundMode.STOP_SHORT, RoundMode.TARGET_SHORT):
+            n = steps.to_integral_value(rounding="ROUND_CEILING")
+        else:
+            n = steps.to_integral_value(rounding="ROUND_HALF_EVEN")
+        return (n * tick).normalize() + Decimal(0)
+
+
 def to_price(value: float, *, tick: Decimal, mode: RoundMode) -> Decimal:
     """``float64 -> Decimal -> round to tick``, in the direction ``mode`` requires.
 
@@ -77,25 +114,8 @@ def to_price(value: float, *, tick: Decimal, mode: RoundMode) -> Decimal:
             likely_cause="a degenerate computation produced inf/nan and was not caught by its guard",
             remediation="the feature that produced this must return NUMERICAL_FAILURE instead",
         )
-    if tick <= 0:
-        raise UnitError(
-            f"tick size must be positive, got {tick}",
-            component=COMPONENT, operation="to_price",
-            context={"tick": str(tick)},
-            likely_cause="instrument metadata was defaulted instead of fetched",
-            remediation="fetch markets_details for this instrument; tick size is never assumed",
-        )
-    with localcontext() as ctx:
-        ctx.prec = 38
-        d = Decimal(repr(value))          # repr, not str(float): shortest round-trip representation
-        steps = d / tick
-        if mode in (RoundMode.STOP_LONG, RoundMode.TARGET_LONG):
-            n = steps.to_integral_value(rounding="ROUND_FLOOR")
-        elif mode in (RoundMode.STOP_SHORT, RoundMode.TARGET_SHORT):
-            n = steps.to_integral_value(rounding="ROUND_CEILING")
-        else:
-            n = steps.to_integral_value(rounding="ROUND_HALF_EVEN")
-        return (n * tick).normalize() + Decimal(0)
+    # repr, not str(float): shortest round-trip representation.
+    return quantize_price(Decimal(repr(value)), tick=tick, mode=mode)
 
 
 def to_quantity(value: float, *, increment: Decimal) -> Decimal:

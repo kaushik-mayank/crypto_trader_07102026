@@ -1387,27 +1387,562 @@ ten minutes, after which 443 is the open port and the engine returns to loopback
 reaches it. Recorded because the trade above is reasonable, not ideal, and the owner should be able
 to close it without research.
 
-
-
-
-
-
-
-
-
-
-
-
-
----
----
----
 ---
 
+## F-045 — With no signals the dashboard could not tell a quiet market from a dead feed ✅
+
+**Date:** 2026-10-10 · **Problem class:** application_bug · **Fixed**
+
+The deployed dashboard showed, all at once:
+
+```
+market data age unknown
+No suggestions right now
+long 0   short 0
+The engine did not report any component health
+```
+
+Three separate defects, and the first is the dangerous one.
+
+`/api/signals/live` dates its freshness envelope from the newest signal's `as_of_ms`. With no signal
+in the database there is nothing to date it from, so `data_as_of_ms` was `null`, so `age_seconds` was
+`null`, and the dashboard printed **"market data age unknown"**.
+
+A quiet market is the *normal* state of this system — twelve strategies with conjunctive conditions
+fire rarely by design — so "no signals" is the common case, not the edge case. Which means the common
+case produced a panel on which a healthy system and a feed that stopped three days ago are
+**indistinguishable**: both show no suggestions, both show no age. The age was the only thing that
+could have separated them, and it was the thing that was missing.
+
+The fix is a fallback, in order of honesty:
+
+1. the newest signal's `as_of_ms` — what the suggestion was actually computed from;
+2. failing that, the newest stored bar's **close** — what the engine would compute from if it ran now;
+3. failing that, `null`, because with neither a signal nor a bar there genuinely is nothing to date.
+
+The payload now also carries `freshness_basis` (`"newest signal"` or `"newest stored bar"`), because a
+number whose meaning changes silently is worse than two numbers. Step 3 is kept: an invented age would
+be worse than no age, which is the whole point of this finding.
+
+The lesson is narrower than "add a fallback". It is that **the empty case is the one to design for
+first** when emptiness is the normal state. Every test written before this one inserted a signal.
+
+---
+
+## F-046 — Polling cannot build history, so a wiped database would never have recovered ✅
+
+**Date:** 2026-10-10 · **Problem class:** application_bug · **Fixed**
+
+Asked whether a cleared database rebuilds itself, the answer was no, and the reason was arithmetic.
+
+`poll_candles` requests `refetch_bars` intervals back from the **newest stored bar**, so that the
+two-fetch finalization rule can settle recent bars. On an empty database there is no newest bar, so it
+requests three bars; next pass, three more. The warm-up needs **2,880 hourly bars**. At three bars a
+minute from a standing start it would arrive, in the sense that an hourglass eventually empties.
+
+So `python -m ingest` now runs the bootstrap plan at startup, every time. It is the same idempotent
+plan the `bootstrap` command uses — recomputed from the database, so a complete database costs one
+query per series and fetches nothing.
+
+Verified end to end, twice:
+
+| Run | Database | Log | Result |
+|---|---|---|---|
+| 1 | empty | `history_incomplete series=15 missing_bars=17580` → `history_filled requests=15 bars=17580` | ~20 s |
+| 2 | filled | `history_complete series=15` | no requests |
+
+**No manual command is needed any more.** Wipe `data/state.db`, restart the service, and recent
+history rebuilds and then stays current. A failure is logged and polling continues — refusing to start
+because the *historical* fill failed would stop the live data too, and the live data is the half that
+cannot be re-fetched later.
+
+---
+
+## F-047 — "The engine did not report any component health" was shown for an engine that was unreachable ✅
+
+**Date:** 2026-10-10 · **Problem class:** application_bug · **Fixed**
+
+The health panel rendered one sentence for three different situations:
+
+| What happened | What the reader needed to know | What they were told |
+|---|---|---|
+| the reply was not JSON at all (a gateway error page) | the engine cannot be reached | "did not report any component health" |
+| the reply had no `components` key | the VM and the dashboard are on different versions | "did not report any component health" |
+| the reply had `components: []` | the API was built without its health source | "did not report any component health" |
+
+The first is the one that matters: `res.json()` on an HTML error page throws, the catch returned
+`payload: null`, and a null payload read downstream as *the engine answered with nothing*. An
+unreachable engine therefore rendered as a calm one — the exact conflation `specs/14` §10 calls the
+most dangerous thing this system can do, arriving by a route that had nothing to do with the service
+layer that was carefully written to prevent it.
+
+Three changes:
+
+* `lib/api.ts` treats an unparseable body as a **transport failure**, naming the HTTP status, rather
+  than as a null payload;
+* `app/page.tsx` classifies the health reading before rendering it (`HealthSection`): transport
+  failure, engine error, non-OK status with no error body, or a real reading;
+* `HealthPanel` gives each of the three nothings its own message and its own remediation.
+
+The general lesson: a `?? []` default is a decision to render absence as emptiness. Every one of them
+is a place where "we don't know" can become "there is nothing", and this codebase cares about that
+distinction everywhere *except* in the twelve characters it takes to write the default.
+
+---
+
+## F-048 — `payload.data` where the signals were at `payload.data.signals`: every suggestion was silently dropped ✅
+
+**Date:** 2026-10-10 · **Problem class:** application_bug · **Fixed**
+
+`frontend/app/page.tsx` read the signal list as:
+
+```ts
+const data: any[] = (sig?.payload as any)?.data ?? [];
+```
+
+The engine puts the list at `payload.data.signals`. So `data` was bound to an *object*, typed as an
+array by the annotation and never checked. `data.length` on an object is `undefined`, so
+`data.length === 0` was false, so the page fell through to `data.map(...)` on something that has no
+`.map` — a TypeError during render.
+
+**No suggestion could ever have appeared on the Vercel dashboard.** Not "appeared wrongly": the page
+would have thrown the moment the engine returned a signals payload at all. It had never been seen
+because the market has been quiet in every window the page has been open, and a quiet market returns
+the same object shape with an empty list inside — which also throws, one line later, at
+`data.map`. (The screen the owner reported, with "No suggestions right now" and an unknown age, came
+from the engine's **own** server-rendered dashboard on the VM, which is Python and has no such bug.
+Attributing that screen to this defect would have been wrong, and the distinction is the only reason
+the real mechanism got traced.)
+
+What makes this worth a finding is not the typo. It is that:
+
+* `any[]` **invited** it — the annotation asserted a shape instead of checking one, so TypeScript had
+  nothing to object to;
+* the failure mode was the most plausible-looking screen in the system. A quiet market is normal, so
+  the wrong output was indistinguishable from the right one;
+* the engine was correct, the proxy was correct, the tests were correct, and the suite was green.
+
+The accessor is now guarded (`Array.isArray(payloadData?.signals)`) and a mismatch renders as a
+problem rather than as calm. `tests/test_frontend_contract.py` reads both sides as text and fails if
+they diverge — weak, because Node is not installed in this environment and the TypeScript cannot be
+compiled here, but the difference between catching it in the suite and catching it by wondering why
+nothing ever appears.
+
+---
+
+## F-049 — Spot gaps were permanent: the live poll repaired futures and capped itself on spot ✅
+
+**Date:** 2026-10-10 · **Problem class:** application_bug · **Fixed**
+
+`poll_candles` requests from the newest stored bar to now, which means the live poll is also the gap
+repair: after an outage the newest stored bar is old, the window spans the hole, and the venue fills
+it on the next pass. No restart, no command.
+
+That worked for futures, which passes no row cap. The spot branch asked for the same window but capped
+the rows at `refetch_bars * 4 + 10` — **30 by default** — and spot candles arrive **newest-first**
+(F-005). So an outage longer than 30 intervals got the newest 30 rows back and left the hole exactly
+where it was. Permanently: `bootstrap` rebuilds **futures only**, so nothing else would ever fetch
+those hours, and the hole would sit in the basis family and the spot/futures disagreement check until
+someone noticed the features were unavailable and went looking for why.
+
+The cap is now derived from the span actually being requested, bounded by the venue's own ceiling of
+1,000, so a wider hole closes over several polls instead of never. Hand-computed in the test: a newest
+bar 100 hours old gives a window starting 103 hours back, which is 105 rows with the partial bars at
+each end — against the old cap of 22 at the test fixture's `refetch_bars = 3`.
+
+Two things this says beyond the fix. First, a repair mechanism that is a **side effect** of another
+mechanism is a repair mechanism nobody tested: the gap filling was real, documented nowhere, and half
+broken. Second, the asymmetry survived because futures is the series everything depends on, so the
+half that worked was the half that was watched.
+
+---
+
+---
+
+## F-050 — A 404 rendered as a calm, empty market: the dashboard trusted any JSON it was handed ✅
+
+**Date:** 2026-10-10 · **Problem class:** application_bug (triggered by configuration) · **Fixed**
+
+This is the finding that explains the reported screen, and it is the worst kind this project can
+produce.
+
+```
+market data age unknown
+No suggestions right now
+long 0   short 0
+The engine did not report any component health
+```
+
+Every line of that is calm. Nothing on it is an error. And it was produced by a dashboard that had
+never reached the engine at all.
+
+The mechanism: `CT_API_BASE` with a path on the end — `http://IP:8000/api` instead of
+`http://IP:8000` — makes the proxy request `/api/api/signals/live`. FastAPI answers
+`404 {"detail": "Not Found"}`. That body is valid JSON, so the dashboard parsed it happily, and then:
+
+| Check | Result | Why |
+|---|---|---|
+| `payload.error` | absent | a FastAPI 404 says `detail`, not `error` |
+| `envelope.system_status` | absent | there is no envelope |
+| `panelState(...)` | **`ready`** | nothing matched, so the default was "fine" |
+| `envelope.age_seconds` | `undefined` | → "market data age unknown" |
+| `data.signals` | absent | → empty list → "No suggestions right now" |
+| `data.components` | absent | → "did not report any component health" |
+
+The service layer was written with exactly this failure in mind — `specs/14` §10, every
+`_failed` returning `DOWN` with a reason, `ServiceResult` carrying its own status. All of it was
+bypassed, because none of it was running. The dashboard's own default was `{ kind: 'ready' }`, and a
+default of "ready" is a decision to describe an unknown system as a working one.
+
+Two fixes, deliberately overlapping:
+
+1. **`panelState` requires an envelope.** Every engine response carries one (`specs/14` §3), so
+   its absence now means *this did not come from the engine*, with the remediation naming
+   `CT_API_BASE` and the trailing path. The default is no longer "ready" for anything that parses.
+2. **The proxy wraps a non-2xx body that is not one of the engine's own errors**, naming the status,
+   the path that was requested and the first 200 bytes of what answered. A genuine engine error still
+   passes through untouched, so its cause and remediation are not replaced by a guess.
+
+The general lesson is about where a default lives. This codebase is careful to distinguish "no data"
+from "no signals" in the one place that produces them — and then threw the distinction away in a
+`?? {}` and a fall-through `return { kind: 'ready' }` at the boundary that consumes them. **A
+permissive default at the edge undoes every strict guarantee behind it.**
+
+---
+
+## F-051 — `entry -0.04145262148598610125`: a spread rendered as a price ✅
+
+**Date:** 2026-10-11 · **Problem class:** application_bug · **Fixed**
+
+Three C1-C cards on the live dashboard, each marked **LONG**, each showing:
+
+```
+entry   -0.04145262148598610125
+stop    -0.0451935447161604650
+target  0
+```
+
+C1-C is the residual relative-value strategy. Its observable is a **beta-adjusted log-return
+spread** against BTC, so its levels are small, and **negative for roughly half of all LONG setups** —
+a long residual trade is entered precisely when the spread sits below what beta explains. The numbers
+are correct. What was wrong is that they were printed under a heading marked *entry*, on a card
+otherwise indistinguishable from a tradeable BTC suggestion, and `-0.0414` is not a price that exists
+on any exchange at any time.
+
+**The engine had already said so, twice.** The signal's own payload carried:
+
+```python
+detail={"levels_are": "residual (spread) units, not price",
+        "execution_note": "both legs execute together on trigger; the notionals differ because the
+                           hedge is beta-weighted, and the UI must show both legs or the trade will
+                           be executed wrong"}
+```
+
+Both ignored, for weeks, because **prose in a payload is advice and a field is a contract.** Nothing
+could branch on a sentence. So `Levels` gained `price_basis`, C1-C sets `RESIDUAL_BASIS`, and the
+dashboard now suppresses the levels row entirely for a non-price basis and renders the **leg table**
+instead — which is what someone would actually place.
+
+Suppressed rather than annotated, deliberately. A number under the word *entry* is a price to anyone
+skimming, whatever the caveat beneath it says.
+
+A second consequence worth recording: a residual must never be tick-rounded. On BTC's 0.1 tick
+(F-054) a residual of −0.0414 would round to −0.1 — a different trade — or to 0, which is not a trade
+at all. The basis field is what makes the rounding skip it.
+
+---
+
+## F-052 — "market data 12m ago — too old to act on", on a system whose data was current ✅
+
+**Date:** 2026-10-11 · **Problem class:** application_bug · **Fixed**
+
+One number doing two jobs, and the result was a red warning that is **always on**.
+
+`/api/signals/live` dates its envelope from the newest signal's `as_of_ms`, which is correct — the
+envelope documents the age of *the payload*, and the payload is signals. But a setup at an hourly
+horizon legitimately stays armed for hours: that is what the strategies are for. So the number grows
+with the setup's age and says nothing whatever about whether data is still arriving.
+
+The dashboard labelled it **"market data"** and judged it against the specs/15 §9 thresholds — amber
+at 60 s, red at 300 s — which were written for a feed, not for a setup. A perfectly healthy system
+with a twelve-minute-old setup therefore reported *"too old to act on"*, permanently.
+
+That is worse than a cosmetic error. A staleness warning that is always lit is a staleness warning
+that gets ignored, and the one day it means something is the day it is read as background noise.
+
+The fix separates the two and keeps three ages on screen, each labelled for what it is:
+
+| Shown as | Measured from | Judged against |
+|---|---|---|
+| market data | the newest **1-minute bar close** | 60 s / 300 s — meaningful, because that series is polled every minute |
+| newest suggestion | the newest signal's `as_of_ms` | nothing; a large value is normal and is stated to be normal |
+| page read | this browser | nothing |
+
+The thresholds did not change. **The number being judged did**, which was the actual error: F-045
+redefined what the envelope's age measures without revisiting what judges it, and the inconsistency
+then had a whole deployment to be visible in.
+
+---
+
+## F-053 — A setup whose premise is "we do not predict direction" was displayed as a LONG ✅
+
+**Date:** 2026-10-11 · **Problem class:** application_bug · **Fixed**
+
+Two cards reading `B-BTC_USDT **LONG** C3-C`, with `entry —` and `stop —`.
+
+C3-C arms **pending**: it watches a structural boundary and trades whichever way the boundary
+resolves — acceptance with the break, rejection against it. It cannot have an entry or a stop yet,
+because the direction decides them. Its `SetupState` is constructed with
+
+```python
+direction=Direction.LONG,     # placeholder; the resolution assigns it
+```
+
+and the signal carries `detail["pending_direction"] = True` to say exactly that.
+
+The card printed the placeholder, in green, under a heading that means a recommendation. A strategy
+whose entire epistemic position is *we cannot predict this* was rendered as a long suggestion — and
+two of them, identical on screen, were in fact two different boundaries with nothing on the card to
+tell them apart.
+
+It also poisoned the exposure strip, which is the panel specs/15 failure mode 5 exists for. It read
+**"long 5, short 4"** and warned that five correlated longs are closer to one leveraged position than
+to five opportunities. Of those five: two were pending-direction placeholders with no direction at
+all, and two were C1-C spreads, which are **beta-neutral by construction** — the opposite of
+concentrated directional risk. The warning was inflated, and inflated by precisely the signals that
+add no directional exposure.
+
+Now: pending setups render as **DIRECTION NOT YET DECIDED** with the level they are watching and the
+rule that will resolve them; the exposure strip counts directional, spread and pending separately;
+and the ENTER NOW banner refuses to print `at —` for a level that does not exist.
+
+The pattern across F-051, F-053 and F-056 is one pattern. **The engine published the right
+information and the dashboard dropped it on the floor three times.** Each layer is written carefully
+and the boundary between them was not written at all.
+
+---
+
+## F-054 — Every published level was unrounded: `stop 83287.42500000000160` ✅
+
+**Date:** 2026-10-11 · **Problem class:** application_bug · **Fixed**
+
+BTC's tick is **0.1** (verified live via `instrument_meta`: BTC 0.1, ETH 0.01, SOL 0.01). The
+dashboard was publishing stops like `83287.42500000000160` and entries like
+`83086.139791666666190` — the raw Decimal residue of ATR arithmetic, to twenty significant figures,
+none of which can be placed as an order.
+
+`features/convert.py:to_price` implements specs/08 §10's rounding rule, with the direction logic
+spelled out and tested. **It had no callers.** The rule was built, tested, and wired to nothing;
+`grep` found it in `tests/` and nowhere in the strategy or risk path.
+
+Rounding is now applied in `build_signal`, via `publishable_levels`, and the placement is the part
+that needed thinking about:
+
+* **Not at the display boundary.** The risk engine computes `k_net`, the breakeven hit rate and the
+  R:R gate *from these numbers*. Round only for display and the reader sees a price that is not the
+  one the arithmetic used — so a trade shown as clearing its R:R floor might not, by a tick, silently.
+* **Not in the risk engine**, which may veto but never alters what a strategy published.
+* **In `build_signal`**, which is the moment a strategy's arithmetic *becomes* a published level, and
+  is one place rather than fourteen.
+
+Direction matters and is not cosmetic: a stop rounds **away** from entry and a target **toward** it,
+so rounding can only ever make a suggestion more conservative. Rounding to nearest would flatter the
+trade by up to half a tick at both ends, for free, in the direction nobody checks.
+
+Three cases decline to round, each for its own reason: a non-price basis (F-051), absent instrument
+metadata (invariant 1 — the tick is never assumed, and the risk engine already vetoes such a signal
+on `DQ_META`), and `None` levels, which must stay `None` rather than becoming a stop at zero.
+
+---
+
+## F-055 — The 404 diagnosis named the wrong cause first ✅
+
+**Date:** 2026-10-11 · **Problem class:** application_bug (in the diagnosis layer) · **Fixed**
+
+The chart page reported:
+
+> likely cause: nothing is served at /api/candles/B-BTC_USDT — **CT_API_BASE probably includes a
+> path**, so the request became a doubled one
+
+`CT_API_BASE` was correct. The real cause was that the VM was running an engine from before
+`/api/candles` existed — the suggestions page worked, the chart page did not.
+
+This one is mine twice over, because the discriminator was sitting in plain sight and the message I
+wrote for F-050 did not use it:
+
+* a wrong `CT_API_BASE` makes **every** path 404, so nothing on the dashboard works;
+* an out-of-date engine 404s only the **new** paths, so some pages work and some do not.
+
+The user could see that some pages worked. The message could have said what that meant and instead
+sent them to check a variable they had already checked.
+
+The message now leads with version skew, gives `update.sh` as the remediation, and states the
+discriminator explicitly — *"if other pages of this dashboard are working, this is the cause and
+CT_API_BASE is fine; a wrong CT_API_BASE would break every page, not one."*
+
+**The lesson is about diagnosis, not about 404s.** F-050 added a diagnostic message and I ranked its
+causes by the one I had just debugged rather than by the evidence available at the point of failure.
+A message that names a plausible cause confidently is worse than one that names two and says how to
+tell them apart, because the reader stops at the first.
+
+---
+
+## F-056 — `signal.detail` was `undefined` on the dashboard, and every display rule read it ✅
+
+**Date:** 2026-10-11 · **Problem class:** application_bug · **Fixed**
+
+`_row_to_signal` returned the stored payload under `payload`, so `detail` was reachable only as
+`signal.payload.detail`. `render.py` reads it correctly. `lib/honesty.ts` read `signal.detail`.
+
+So **every rule in that file was branching on `undefined`**:
+
+| Rule | What it read | What it did |
+|---|---|---|
+| `displayable` | `detail.control`, `detail.tradeable` | the frontend's control-strategy firewall — the third of three layers — never fired. Nothing leaked, because the other two work |
+| `validationNotice` | `detail.validated` | returned "never tested against history" because `undefined !== true`. The **right answer for the wrong reason**, and it would have begun lying the moment anything was validated |
+| `confidenceCopy` | `detail.breakeven_hit_rate` | fell through to the column of the same name, so it worked by luck |
+
+Both new fields from this session — `price_basis` and `pending_direction` — would have been read as
+`undefined` too, which means F-051 and F-053 would have been "fixed" and still broken, and the tests
+that assert them are text-matching tests that would not have caught it.
+
+`detail` is now lifted to the top level by the engine, and the frontend reads it through a single
+`signalDetail()` with a `payload.detail` fallback — the fallback because the VM and Vercel deploy
+separately, which is the same version skew that caused F-055 three hours earlier.
+
+**Three accessor bugs in one session** (F-048, F-056, and F-050's missing envelope), all of the same
+shape: a reader assuming a payload's shape instead of checking it, in a language where `undefined`
+propagates silently through every comparison. Node is not installed on this machine so the
+TypeScript cannot be compiled, and `any` types mean compiling would not have caught these anyway.
+What catches them is reading the producer and the consumer side by side, which is now what
+`tests/test_frontend_contract.py` does for each accessor by name.
+
+---
+
+---
+
+## F-057 — `.gitignore` silently excluded the Data page, so the commit that added it added everything except it ✅
+
+**Date:** 2026-10-11 · **Problem class:** configuration (mine) · **Fixed**
+
+The Data page returned a Vercel 404. The file existed, the tests read it, the nav linked it, and it
+had **never left the laptop.**
+
+`.gitignore` line 8 was:
+
+```
+data/
+```
+
+A bare `data/` matches a directory named `data` at *any* depth. The holdout lives at `data/` in the
+repository root, which is what the rule is for — but it also matched `frontend/app/data/`, the
+dashboard route called "data".
+
+```
+$ git check-ignore -v frontend/app/data/page.tsx
+.gitignore:8:data/   frontend/app/data/page.tsx
+```
+
+So `git add -A` skipped it, the commit succeeded, the push succeeded, Vercel built successfully, and
+**nothing anywhere reported a problem** — because an ignored file is not an error. The only
+symptom was a 404 on a route whose source was sitting on the development machine.
+
+Fixed by anchoring the rule to the repository root: `/data/` and `/logs/`. The holdout is still
+ignored (verified: `data/state.db`, `data/raw/`, `data/backfill/`, `logs/`, `.env` all still match),
+and `frontend/app/data/` no longer is.
+
+`tests/test_frontend_contract.py` now runs `git check-ignore` over every file under `src/`, `tests/`
+and the dashboard's own source and fails if any of them cannot be committed. Confirmed to catch the
+original bug by restoring the old pattern and watching it fail.
+
+**The lesson is about which failures are silent.** This project is careful about failures that
+*report* wrongly — a stale number, a vetoed signal, an empty panel. This one reported nothing at
+all, at four separate stages that each had every opportunity to say something. The next person to
+add a route called `data`, `logs`, `build` or `dist` would have hit it too, which is why the guard is
+a test and not a comment.
+
+---
+
+## F-058 — The display fixes would have looked deployed and not been ✅
+
+**Date:** 2026-10-11 · **Problem class:** application_bug · **Fixed**
+
+Noticed while tracing F-059, before it could cost anything.
+
+F-051 and F-053 were fixed by having the engine publish `price_basis` and `pending_direction`, and
+the dashboard branch on them. Correct, and incomplete: **the dashboard and the engine deploy
+separately**, so for as long as the VM lags, neither field exists in the payload, both branches take
+their default, and a C1-C residual is rendered under the word *entry* exactly as before.
+
+The same gap persists *after* an upgrade, for a different reason: the `signals` table still holds
+setups armed by the previous version, and those rows will never gain the new fields.
+
+Both dashboards now fall back to what an older engine already published:
+
+| Decision | Preferred | Fallbacks already in old payloads |
+|---|---|---|
+| are these levels prices? | `price_basis` | `two_leg`, `levels_are` containing "residual" |
+| is the direction decided? | `pending_direction` | `pending` in the setup context; two `entry_triggers` with no entry |
+
+The fallbacks are not defensive padding; they are the case that actually occurs. A fix whose
+correctness depends on both halves of a two-sided deployment being simultaneous is a fix that is
+wrong for the whole period anyone is watching it.
+
+---
+
+## F-059 — Two sessions of deployment debugging because the engine code was never pushed ✅
+
+**Date:** 2026-10-11 · **Problem class:** configuration (process) · **Fixed**
+
+The chart page 404'd. `diagnose.sh` reported **OK on all eight sections**. The owner ran it twice,
+checked the environment variables, confirmed the services, confirmed the data, and the page stayed
+broken.
+
+The reason, found by looking at git rather than at the VM:
+
+```
+$ git log --oneline -3
+322fa30 data1
+e408b5d chart 1
+...
+$ git show --stat 322fa30     # 8 files, all under frontend/
+$ git show HEAD:src/api/app.py | grep -c "api/candles"
+0
+```
+
+**None of the backend work was in GitHub.** Two commits had been made and both contained only
+frontend files; every `src/` change from two sessions — `/api/candles`, `/api/sources`, tick
+rounding, `price_basis`, the freshness split, the ingest self-bootstrap, the lifted `detail` —
+existed only as uncommitted modifications on the laptop. `src/snapshot/request.py` was untracked
+entirely, so even a partial push would have broken the import on the VM.
+
+So `update.sh` was doing exactly what it was asked: fetching a branch whose newest commit did not
+contain the route, reporting "already up to date", and restarting the same code. **My instruction to
+run it was correct and useless**, and I gave it twice without once checking whether the code it
+pulls contains the fix.
+
+Three changes, because the failure had three places it could have been caught:
+
+1. **`diagnose.sh` now asks the running engine which routes it serves** (section 4b) and prints the
+   commit it is running with its distance from the remote (4c). Every other section asks *is the
+   engine working*; none asked *is the engine the version the dashboard expects*, and that is the
+   question when one page 404s while the rest looks perfect.
+2. **`update.sh` no longer lets "already up to date" read as success.** It says that this means
+   nothing new has been *pushed*, not that the VM is current, and after restarting it probes the
+   dashboard's routes and names any that 404.
+3. **`BUG_SOLVE.md` gives the push procedure**, with `git status` as a verification step rather than
+   a formality. Previous rounds told the owner how to deploy and never how to commit, which assumed
+   a step that was not happening.
+
+The general lesson: **a two-sided deployment drifts apart by default, and neither side can see the
+other's version.** Every symptom of that drift looks like a configuration problem on the side you
+happen to be looking at. The fix is for each side to be able to state its own version and for one of
+them to check the other's — not more careful instructions.
 
 ---
 
 ## Open questions
+
 
 | # | Question | Blocking | Decision it leaves open |
 |---|---|---|---|

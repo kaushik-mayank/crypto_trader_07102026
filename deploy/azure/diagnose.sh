@@ -132,6 +132,73 @@ if [ -n "${TOKEN:-}" ] && [ "$CODE" = "401" ]; then
   fi
 fi
 
+# ---- 4b. is this engine new enough for the dashboard? ---------------------------------------
+# The check that was missing, and it cost two rounds of debugging.
+#
+# Every section above passed on an installation where the chart page was broken, because every
+# section above asks "is the engine working" and none asked "is the engine the version the dashboard
+# expects". The VM and Vercel deploy separately, so they drift apart by default, and the symptom is a
+# single page 404ing while the rest of the dashboard looks perfect (F-055, F-059).
+#
+# So: ask the running process which routes it actually serves. A 404 here names the missing route
+# and the fix, instead of leaving a reader to suspect their settings.
+head2 "4b. Does this engine serve every route the dashboard needs?"
+if [ -n "${TOKEN:-}" ] && [ "$CODE" = "401" ]; then
+  MISSING=""
+  for route in       "/api/signals/live"       "/api/health"       "/api/regime"       "/api/candles/B-BTC_USDT"       "/api/sources"; do
+    RC=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8          -H "x-auth-token: $TOKEN" "http://127.0.0.1:8000${route}" 2>/dev/null || echo 000)
+    case "$RC" in
+      200|503) ok "$route -> $RC" ;;
+      404)     bad "$route -> 404: this engine does not have that route"
+               MISSING="$MISSING $route" ;;
+      *)       warn "$route -> $RC (unexpected, but the route exists)" ;;
+    esac
+  done
+  if [ -n "$MISSING" ]; then
+    note ""
+    note "This engine is OLDER than the dashboard. It is not a settings problem and not a firewall"
+    note "problem: the code on this machine does not contain those routes."
+    note ""
+    note "fix, in this order:"
+    note "  1. ON YOUR LAPTOP, make sure the code is actually pushed:"
+    note "       git status            # must show nothing left to commit"
+    note "       git push"
+    note "  2. HERE:"
+    note "       sudo bash $APP_DIR/deploy/azure/update.sh"
+    note "  3. HERE, confirm the routes appear:"
+    note "       bash $APP_DIR/deploy/azure/diagnose.sh"
+    note ""
+    note "If step 2 says 'Already up to date' while this still fails, the code never reached"
+    note "GitHub — check step 1 again. That is the common case."
+  fi
+else
+  warn "skipped: needs a working local API and a token (see section 4)"
+fi
+
+# ---- 4c. which commit is this machine running? ----------------------------------------------
+# Printed unconditionally, because the answer to "did my push arrive" is one line and nobody should
+# have to reconstruct it from timestamps.
+head2 "4c. Deployed version"
+if [ -d "$APP_DIR/.git" ]; then
+  DESC=$(sudo -u "$SERVICE_USER" git -C "$APP_DIR" log -1 --format='%h %cd %s' --date=short 2>/dev/null)
+  if [ -n "$DESC" ]; then
+    note "running commit: $DESC"
+    BEHIND=$(sudo -u "$SERVICE_USER" git -C "$APP_DIR" rev-list --count HEAD..@{u} 2>/dev/null || echo "?")
+    if [ "$BEHIND" = "0" ]; then
+      ok "up to date with the branch it tracks"
+    elif [ "$BEHIND" = "?" ]; then
+      note "could not compare with the remote (no network, or no upstream set)"
+    else
+      bad "$BEHIND commit(s) behind the remote"
+      note "fix: sudo bash $APP_DIR/deploy/azure/update.sh"
+    fi
+  else
+    warn "could not read the git log here"
+  fi
+else
+  warn "$APP_DIR is not a git checkout, so the version cannot be reported"
+fi
+
 # ---- 5. reachable from outside -------------------------------------------------------------
 head2 "5. Reachable from outside (Vercel -> this machine)"
 BIND=$(sudo grep -E '^CT_SERVER__HOST=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]')

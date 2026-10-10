@@ -25,36 +25,14 @@ from core.errors import ALL_ERRORS, StartupError
 from core.health import HealthReport
 from core.logging import get_logger, setup_logging
 from features.engine import FeatureEngine
-from normalize.canonical import Product, Timeframe
 from risk.engine import RiskEngine
-from snapshot.builder import WARMUP_BARS, SeriesRequest, SnapshotBuilder, SnapshotRequest
-from snapshot.models import InstrumentKey, SeriesKey
+from snapshot.builder import SnapshotBuilder
+from snapshot.request import ASSETS, build_request
 from store import open_store
 from store.reader import ReadOnlyStore
 from strategy.registry import live_strategies
 
 log = get_logger("app.main")
-
-ASSETS = ("B-BTC_USDT", "B-ETH_USDT", "B-SOL_USDT")
-#: The trigger timeframes ACT needs beyond the alpha set: 15m sizes the unit, 1m confirms.
-TRIGGER_BARS = {Timeframe.M15: 200, Timeframe.M1: 240}
-
-
-def build_request(assets=ASSETS, product=Product.FUTURES) -> SnapshotRequest:
-    series = [SeriesRequest(SeriesKey(a, product, tf), bars=WARMUP_BARS[tf])
-              for a in assets for tf in (Timeframe.H1, Timeframe.H4, Timeframe.D1)]
-    series += [SeriesRequest(SeriesKey(a, product, tf), bars=n)
-               for a in assets for tf, n in TRIGGER_BARS.items()]
-    return SnapshotRequest(
-        series=tuple(series),
-        tier_b=tuple((s, a) for a in assets
-                     for s in ("futures_rt", "spot_ticker", "positioning", "futures_book",
-                               "spot_book")),
-        instruments=tuple(InstrumentKey(a, product) for a in assets),
-        forming=tuple(SeriesKey(a, product, Timeframe.H1) for a in assets),
-        tier_b_history_ms=7 * 86_400_000,
-    )
-
 
 def build_runner(store: Any, settings: Settings) -> AppRunner:
     registry = load_registry(settings.paths.parameters_file)

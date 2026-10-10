@@ -19,6 +19,7 @@ from api.render import (
     render_exposure_strip,
     render_health,
     render_page,
+    render_signal_card,
     render_signals,
 )
 from api.services import FreshnessEnvelope, ServiceResult, build_services
@@ -558,3 +559,462 @@ def test_the_runner_health_can_omit_the_writers_store_for_a_request_thread():
     assert "include_store" in source
     # The store check must be gated on the flag, not merely accept it.
     assert "if include_store else None" in source
+
+
+# ---- the candle endpoint: the view that shows whether data is arriving at all ----------------
+
+def insert_bar(store, *, asset="B-BTC_USDT", timeframe="1h", open_time_ms=T0, close="85000",
+               is_final=True, product="futures"):
+    store.conn.execute(
+        """INSERT INTO bars (asset, product, timeframe, open_time_ms, open, high, low, close,
+               volume_base, is_final, synthesised, source, content_hash, first_fetched_ms,
+               last_fetched_ms, fetch_count)
+           VALUES (?,?,?,?,?,?,?,?,?,?,0,'test',?,?,?,1)""",
+        (asset, product, timeframe, open_time_ms, "84900", "85100", "84800", close,
+         "12.5", int(is_final), f"h{open_time_ms}", open_time_ms, open_time_ms))
+    store.conn.commit()
+
+
+def test_candles_come_back_oldest_first_whatever_order_they_were_written_in(store):
+    """Ordering is a property of the data and belongs where the data is produced (specs/10 §5).
+
+    A client that forgot to sort would draw the market mirrored — rising where it fell — and nothing
+    on the screen would look wrong.
+    """
+    for i in (2, 0, 1):                     # written out of order on purpose
+        insert_bar(store, open_time_ms=T0 + i * 3_600_000, close=str(85000 + i))
+    _, market, _ = build_services(store)
+    payload = market.candles("B-BTC_USDT", timeframe="1h").payload
+    assert [c["t"] for c in payload["candles"]] == [T0, T0 + 3_600_000, T0 + 7_200_000]
+    assert [c["c"] for c in payload["candles"]] == ["85000", "85001", "85002"]
+
+
+def test_candle_prices_stay_strings_so_nothing_is_rounded_on_the_way_out(store):
+    """The store keeps decimals as TEXT precisely so no float ever touches a price. JSON numbers
+    *are* floats, so emitting them as numbers would reintroduce the rounding the store exists to
+    avoid — on the one screen a person uses to check the data."""
+    insert_bar(store, close="85000.12345678")
+    _, market, _ = build_services(store)
+    candle = market.candles("B-BTC_USDT", timeframe="1h").payload["candles"][0]
+    for key in ("o", "h", "l", "c", "v"):
+        assert isinstance(candle[key], str), f"{key} must stay a string"
+    assert candle["c"] == "85000.12345678", "the exact stored value must survive"
+
+
+def test_an_unconfirmed_bar_is_returned_and_flagged_rather_than_hidden(store):
+    """Both halves matter. Hiding it would make the current interval look missing; returning it
+    unflagged would present a bar the feature layer refuses to compute on as settled."""
+    insert_bar(store, open_time_ms=T0, is_final=True)
+    insert_bar(store, open_time_ms=T0 + 3_600_000, is_final=False)
+    _, market, _ = build_services(store)
+    payload = market.candles("B-BTC_USDT", timeframe="1h").payload
+    assert [c["final"] for c in payload["candles"]] == [True, False]
+    assert payload["pending_confirmation"] == 1
+
+
+def test_candle_age_is_measured_from_the_bars_close_not_its_open(store):
+    """A 1h bar that opened 59 minutes ago is current, not an hour old.
+
+    Measuring from the open would put every healthy hourly feed permanently in the amber band, and a
+    freshness warning that is always on is a freshness warning nobody reads.
+    """
+    now_ms = int(time.time() * 1000)
+    opened = now_ms - 59 * 60_000           # opened 59 minutes ago, closes in a minute
+    insert_bar(store, open_time_ms=opened)
+    _, market, _ = build_services(store)
+    result = market.candles("B-BTC_USDT", timeframe="1h")
+    assert result.envelope.data_as_of_ms == opened + 3_600_000
+    # The close is a minute in the future, so the age clamps to zero rather than going negative.
+    assert result.envelope.age_seconds == 0.0
+
+
+def test_an_unknown_interval_is_a_bad_request_not_an_outage(store):
+    """The problem class is what tells the operator where to look, and this one must not say
+    ``infrastructure``: a chart asking for an interval this system never stores is the caller being
+    wrong, and a 503 would send someone to check the VM, the firewall and the service logs for a
+    mistake that is entirely in the query string."""
+    from core.errors import ProblemClass
+
+    _, market, _ = build_services(store)
+    result = market.candles("B-BTC_USDT", timeframe="2h")
+    assert result.error is not None
+    assert result.error.problem_class is ProblemClass.CONFIGURATION
+    assert "2h" in result.error.message
+    assert status_code_for(result) == 400, "a caller's mistake is not a service outage"
+    # And the payload keeps its shape, so a renderer does not also have to handle None.
+    assert result.payload["candles"] == []
+
+
+def test_a_candle_limit_is_clamped_rather_than_reaching_the_query_unbounded(store):
+    for i in range(5):
+        insert_bar(store, open_time_ms=T0 + i * 3_600_000)
+    _, market, _ = build_services(store)
+    assert market.candles("B-BTC_USDT", limit=2).payload["count"] == 2
+    assert market.candles("B-BTC_USDT", limit=0).payload["count"] == 1, "clamped up to 1"
+    assert market.candles("B-BTC_USDT", limit=10_000).payload["count"] == 5
+    # The total is reported separately, so "2 drawn of 5 stored" is sayable.
+    assert market.candles("B-BTC_USDT", limit=2).payload["stored_total"] == 5
+
+
+def test_an_asset_with_no_bars_is_empty_but_not_an_error(store):
+    """Nothing stored yet is a real, reportable fact. It must not raise, and it must not claim an
+    age it does not have."""
+    _, market, _ = build_services(store)
+    result = market.candles("B-SOL_USDT", timeframe="1d")
+    assert result.ok
+    assert result.payload["candles"] == [] and result.payload["stored_total"] == 0
+    assert result.payload["newest_ms"] is None
+    assert result.envelope.age_seconds is None, "an absent age must not read as fresh"
+
+
+def test_the_candle_route_is_reachable_and_validated_over_http(store):
+    """Through ``ReadOnlyStore``, as production does: a sync handler runs in a worker thread and a
+    sqlite3 connection belongs to the thread that made it (F-043b)."""
+    from fastapi.testclient import TestClient
+
+    from store.reader import ReadOnlyStore
+
+    insert_bar(store, open_time_ms=T0)
+    reader = ReadOnlyStore(store.path)
+    signals, market, health = build_services(reader, health_source=healthy_report)
+    app = create_app(signals=signals, market=market, health=health)
+    with TestClient(app) as client:
+        ok = client.get("/api/candles/B-BTC_USDT?timeframe=1h&limit=10")
+        assert ok.status_code == 200
+        assert ok.json()["data"]["count"] == 1
+
+        bad = client.get("/api/candles/B-BTC_USDT?timeframe=2h")
+        assert bad.status_code == 400
+        assert bad.json()["error"]["problem_class"] == "configuration"
+
+
+# ---- the freshness fallback (F-045) ---------------------------------------------------------
+
+def test_with_no_signals_the_age_falls_back_to_the_newest_stored_bar(store):
+    """F-045. A quiet market is the normal state, so "no signals" is the common case — and with no
+    signal to date the envelope reported ``age_seconds: null``, which the dashboard rendered as
+    "market data age unknown".
+
+    That is the one thing a reader must never be left with: unable to tell a healthy quiet market
+    from a feed that stopped hours ago. Both show no suggestions; only the age distinguishes them.
+    """
+    insert_bar(store, open_time_ms=T0)
+    signals, _, _ = build_services(store)
+    result = signals.live()
+    assert result.payload["signals"] == []
+    assert result.envelope.data_as_of_ms == T0 + 3_600_000, "the newest bar's close"
+    assert result.payload["freshness_basis"] == "newest stored bar"
+
+
+def test_a_signals_own_timestamp_still_wins_when_there_is_one(store):
+    """The fallback is a fallback. A signal's own ``as_of_ms`` is what the suggestion was computed
+    from, and that is the honest age for a panel showing suggestions."""
+    insert_bar(store, open_time_ms=T0 + 86_400_000)      # a much newer bar
+    insert_signal(store, as_of=T0)
+    signals, _, _ = build_services(store)
+    result = signals.live()
+    assert result.envelope.data_as_of_ms == T0
+    assert result.payload["freshness_basis"] == "newest signal"
+
+
+def test_an_empty_database_still_reports_an_unknown_age_rather_than_inventing_one(store):
+    """With neither a signal nor a bar there is genuinely nothing to date the data from, and the
+    envelope must say so. An invented age would be worse than no age."""
+    signals, _, _ = build_services(store)
+    result = signals.live()
+    assert result.envelope.data_as_of_ms is None
+    assert result.envelope.age_seconds is None
+
+
+# ---- market-data freshness is not the newest setup's age (F-052) ----------------------------
+
+def test_market_data_freshness_is_reported_apart_from_the_newest_signals_age(store):
+    """The two were one number, and the result was a permanent false alarm.
+
+    The envelope dates the *payload*, which for this endpoint is the newest signal. A setup at an
+    hourly horizon legitimately stays armed for hours, so that number grows with the setup's age and
+    says nothing about whether data is arriving. The dashboard labelled it "market data" and judged
+    it against a 300-second red threshold, so a healthy system with a 12-minute-old setup reported
+    **"too old to act on"**.
+
+    Hand-computed: the signal is stamped at T0 and the newest 1m bar closes a minute after T0, so the
+    two ages must differ by exactly that minute and must not be the same field.
+    """
+    insert_signal(store, as_of=T0)
+    insert_bar(store, timeframe="1m", open_time_ms=T0)
+    signals, _, _ = build_services(store)
+    payload = signals.live().payload
+
+    assert payload["market_data"]["as_of_ms"] == T0 + 60_000, "the 1m bar's close"
+    assert payload["market_data"]["basis"] == "newest 1m bar close"
+    assert payload["market_data"]["interval_s"] == 60
+    # The signal's own age stays on the envelope, unchanged, because that is what it means.
+    assert signals.live().envelope.data_as_of_ms == T0
+
+
+def test_market_data_freshness_is_absent_rather_than_zero_when_no_bars_exist(store):
+    """An absent age must stay absent: `Freshness` renders "the engine did not say how old this is",
+    which is honest, where a 0 would read as perfectly fresh."""
+    insert_signal(store, as_of=T0)
+    signals, _, _ = build_services(store)
+    market = signals.live().payload["market_data"]
+    assert market["as_of_ms"] is None and market["age_s"] is None
+
+
+# ---- /api/sources: what are we actually fetching? -------------------------------------------
+
+def test_sources_reports_each_series_with_its_rows_newest_bar_and_last_close(store):
+    insert_bar(store, timeframe="1h", open_time_ms=T0, close="85000")
+    insert_bar(store, timeframe="1h", open_time_ms=T0 + 3_600_000, close="85500", is_final=False)
+    insert_bar(store, timeframe="1d", open_time_ms=T0, close="84000")
+    _, market, _ = build_services(store)
+    payload = market.sources().payload
+
+    by_tf = {s["timeframe"]: s for s in payload["series"]}
+    assert by_tf["1h"]["rows"] == 2
+    assert by_tf["1h"]["pending_confirmation"] == 1
+    assert by_tf["1h"]["last_value"]["c"] == "85500", "the newest bar's close, not the oldest"
+    assert by_tf["1h"]["newest_ms"] == T0 + 3_600_000 + 3_600_000, "measured from the bar's close"
+    assert by_tf["1d"]["rows"] == 1
+    assert by_tf["1h"]["tier"] == "A", "candles are rebuildable from the venue"
+
+
+def test_a_series_lateness_is_reported_in_intervals_not_only_in_seconds(store):
+    """Seconds cannot compare across timeframes: twenty minutes is a dead 1-minute feed and a
+    perfectly healthy daily one. One absolute threshold for both is what makes a freshness warning
+    permanent, and a permanent warning is one nobody reads.
+
+    Hand-computed: a 1h bar whose close was five hours ago is five intervals behind.
+    """
+    now_ms = int(time.time() * 1000)
+    opened = ((now_ms // 3_600_000) - 6) * 3_600_000      # closed 5 h ago, aligned
+    insert_bar(store, timeframe="1h", open_time_ms=opened)
+    _, market, _ = build_services(store)
+    series = market.sources().payload["series"][0]
+    assert series["interval_s"] == 3600
+    assert series["intervals_behind"] in (5, 6), "five whole intervals, six if the clock just ticked"
+
+
+def test_sources_reports_every_point_in_time_table_with_what_it_last_delivered(store):
+    store.conn.execute(
+        """INSERT INTO futures_rt (asset, ts_ms, funding_rate, predicted_funding_rate, mark_price,
+               last_price, received_at_ms, source_ts_ms)
+           VALUES ('B-BTC_USDT', ?, '0.00001152', '0.00001', '83481.6', '83473.9', ?, ?)""",
+        (T0, T0, T0))
+    store.conn.commit()
+    _, market, _ = build_services(store)
+    by_id = {s["id"]: s for s in market.sources().payload["point_in_time"]}
+
+    rt = by_id["futures_rt"]
+    assert rt["tier"] == "B" and rt["rebuildable"] is False
+    assert "no archive endpoint" in rt["note"], (
+        "the permanence of a Tier B gap is the single most important thing to say about it"
+    )
+    asset = rt["per_asset"][0]
+    assert asset["asset"] == "B-BTC_USDT" and asset["rows"] == 1
+    assert asset["last_value"]["funding_rate"] == "0.00001152"
+    assert asset["newest_ms"] == T0
+
+
+def test_a_source_nothing_polls_says_so_rather_than_showing_a_bare_zero(store):
+    """Three different readings of an empty table, and only one is true for `trades`: we do not
+    collect it. A bare zero would read as a broken poller; omitting the row would leave a reader
+    wondering whether trades were being recorded."""
+    _, market, _ = build_services(store)
+    by_id = {s["id"]: s for s in market.sources().payload["point_in_time"]}
+    assert by_id["trades"]["collected"] is False
+    assert "does not poll" in by_id["trades"]["note"]
+    # And a source that *is* collected does not claim otherwise.
+    assert by_id["futures_rt"]["collected"] is True
+
+
+def test_one_unreadable_source_does_not_hide_the_others(store):
+    """The whole point of this page is comparing sources, so one failure must not take the
+    comparison with it. The error is attached to **that source** and the rest still report."""
+    store.conn.execute("DROP TABLE positioning")
+    store.conn.commit()
+    insert_bar(store, timeframe="1h", open_time_ms=T0)
+    _, market, _ = build_services(store)
+    result = market.sources()
+
+    by_id = {s["id"]: s for s in result.payload["point_in_time"]}
+    assert by_id["positioning"]["readable"] is False
+    assert by_id["positioning"]["error"]["problem_class"] == "application_bug"
+    assert by_id["futures_rt"]["readable"] is True, "the other sources must still be reported"
+    assert len(result.payload["series"]) == 1, "and the series must still be reported"
+
+
+def test_sources_reports_data_quality_events_because_fresh_is_not_correct(store):
+    """A source can be perfectly current and still be throwing rows away. Timestamps alone would
+    call that healthy, so the rejection counts sit on the same page."""
+    from store.interface import DQEvent
+
+    store.record_dq_event(DQEvent(kind="ROWS_REJECTED", component="normalize.futures_rt",
+                                  operation="futures_rt", at_ms=int(time.time() * 1000),
+                                  problem_class="data_quality", severity="warning",
+                                  asset="B-BTC_USDT", detail={"reasons": {"STALE": 3}}))
+    _, market, _ = build_services(store)
+    dq = market.sources().payload["data_quality"]
+    assert dq["readable"] is True and dq["window_h"] == 24
+    assert dq["events"][0]["kind"] == "ROWS_REJECTED" and dq["events"][0]["count"] == 1
+
+
+def test_the_sources_route_answers_over_http_and_takes_no_parameters(store):
+    """No parameters at all, deliberately: this is the endpoint someone opens when they do not yet
+    know what is wrong, so there must be nothing to get wrong about the request."""
+    import inspect
+
+    from fastapi.testclient import TestClient
+
+    from store.reader import ReadOnlyStore
+
+    insert_bar(store, timeframe="1h", open_time_ms=T0)
+    reader = ReadOnlyStore(store.path)
+    signals, market, health = build_services(reader, health_source=healthy_report)
+    app = create_app(signals=signals, market=market, health=health)
+    with TestClient(app) as client:
+        response = client.get("/api/sources")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["data"]["series"][0]["rows"] == 1
+        assert body["envelope"]["age_seconds"] is not None
+
+    signature = inspect.signature(market.sources)
+    assert not [p for p in signature.parameters.values() if p.name != "self"]
+
+
+# ---- both dashboards must apply the same two rules (F-051, F-053) ---------------------------
+
+def _pending_signal():
+    """A C3-C-shaped row: a placeholder direction and no levels."""
+    return {"signal_id": "p1", "strategy_id": "C3-C", "asset": "B-BTC_USDT", "direction": "LONG",
+            "state": "SETUP_DETECTED", "entry": None, "stop": None, "targets": [],
+            "detail": {"pending_direction": True, "boundary": "85000"},
+            "payload": {"raw": {"direction": "LONG", "rationale": "watching a boundary"}}}
+
+
+def _spread_signal(state="SETUP_DETECTED"):
+    """A C1-C-shaped row: residual levels and a leg table."""
+    return {"signal_id": "s1", "strategy_id": "C1-C", "asset": "B-ETH_USDT", "direction": "LONG",
+            "state": state, "entry": "-0.04145262148598610125", "stop": "-0.0451935447161604650",
+            "targets": ["0"],
+            "detail": {"price_basis": "residual", "two_leg": True,
+                       "legs": [{"asset": "B-ETH_USDT", "direction": "LONG", "price": "2575",
+                                 "notional_weight": "1.00"},
+                                {"asset": "B-BTC_USDT", "direction": "SHORT", "price": "83470",
+                                 "notional_weight": "0.9123"}]},
+            "payload": {"raw": {"direction": "LONG", "rationale": "residual in the tail"}}}
+
+
+def test_the_server_dashboard_does_not_print_a_placeholder_direction_as_a_recommendation():
+    """C3-C's `direction` is a structural placeholder — the strategy's whole premise is that it does
+    not predict which way the level breaks. Printing "LONG" states a recommendation it refuses to
+    make, and the Vercel card and this one were getting it wrong identically."""
+    html = render_signal_card(_pending_signal())
+    assert "direction not yet decided" in html
+    assert "85000" in html, "the level being watched must be named"
+    assert ">LONG<" not in html, "the placeholder must not be rendered as a direction"
+    # And no levels block, because there is nothing to place rather than levels unknown.
+    assert "<span>entry</span>" not in html
+
+
+def test_the_server_dashboard_does_not_print_a_residual_as_an_entry_price():
+    html = render_signal_card(_spread_signal())
+    assert "not prices" in html
+    assert "0.9123" in html and "83470" in html, "both legs must be shown or the trade is executed wrong"
+    assert "<span>entry</span>" not in html, (
+        "a number under the word entry is a price to anyone skimming, whatever the caveat says"
+    )
+    # The residual is still shown, labelled by its basis.
+    assert "residual entry" in html
+
+
+def test_the_server_action_bar_refuses_an_undecided_entry():
+    pending = {**_pending_signal(), "state": "ENTER_NOW"}
+    html = render_action_bar([pending])
+    assert "no entries live" in html, "a pending setup is not an entry instruction"
+
+    spread = _spread_signal(state="ENTER_NOW")
+    html2 = render_action_bar([spread])
+    assert "two-leg spread" in html2
+    assert "-0.0414" not in html2, "a residual must never appear as a trigger price"
+
+
+def test_the_server_exposure_strip_counts_only_directional_signals():
+    """Hand-counted: one real long, one pending, one spread. The strip must say 1 long 0 short —
+    not 3 long — because the pending setup has no direction and the spread is beta-neutral by
+    construction, which is the opposite of concentrated directional risk."""
+    real = {"signal_id": "r1", "asset": "B-SOL_USDT", "direction": "LONG",
+            "state": "SETUP_DETECTED", "detail": {}, "payload": {}}
+    html = render_exposure_strip([real, _pending_signal(), _spread_signal()])
+    assert "1 long" in html and "0 short" in html
+
+
+def test_both_dashboards_read_the_same_two_flags():
+    """The parity is the point: the two dashboards claim the same specs/15 rules, so a fix in one is
+    half a fix. Asserted on both sides rather than trusted."""
+    import inspect
+
+    from api import render
+
+    server = inspect.getsource(render)
+    assert "pending_direction" in server and "price_basis" in server
+
+    frontend = (Path(__file__).resolve().parents[1] / "frontend" / "components" / "Panels.tsx"
+                ).read_text(encoding="utf-8")
+    assert "pending_direction" in frontend and "price_basis" in frontend
+
+
+# ---- the display must stay correct against an OLDER engine (F-058) -------------------------
+
+def test_an_old_engines_two_leg_signal_is_still_not_rendered_as_a_price():
+    """The fix for F-051 added `price_basis`. The VM and the dashboard deploy separately, so for as
+    long as the engine lags, that field is absent — and without a fallback the fix would have looked
+    deployed while a C1-C residual was still printed under the word *entry*.
+
+    `two_leg` and `levels_are` have been in C1-C's payload since it was written, so an old signal is
+    still identifiable. This is also the after-upgrade case: the signals table still holds setups
+    armed by the previous version.
+    """
+    old = {"signal_id": "o1", "strategy_id": "C1-C", "asset": "B-BTC_USDT", "direction": "LONG",
+           "state": "SETUP_DETECTED", "entry": "-0.0414", "stop": "-0.0451", "targets": ["0"],
+           # No `price_basis` anywhere, exactly as the deployed engine writes it.
+           "payload": {"raw": {"direction": "LONG", "rationale": "residual"},
+                       "detail": {"two_leg": True,
+                                  "levels_are": "residual (spread) units, not price",
+                                  "legs": [{"asset": "B-BTC_USDT", "direction": "LONG",
+                                            "price": "83470", "notional_weight": "1.00"}]}}}
+    html = render_signal_card(old)
+    assert "not prices" in html
+    assert "<span>entry</span>" not in html, (
+        "without the fallback the old signal renders a residual as an entry price"
+    )
+    assert "83470" in html, "the executable leg price must still be shown"
+
+
+def test_an_old_engines_pending_setup_is_still_not_rendered_as_a_long():
+    """`pending` in the setup context, or a two-sided bracket with no entry, is the same statement
+    `pending_direction` makes — from a version that did not have the field."""
+    for detail in ({"pending": True, "boundary": "85000"},
+                   {"entry_triggers": ["84000", "86000"]}):
+        old = {"signal_id": "o2", "strategy_id": "C3-C", "asset": "B-BTC_USDT",
+               "direction": "LONG", "state": "SETUP_DETECTED", "entry": None, "stop": None,
+               "targets": [], "payload": {"raw": {"direction": "LONG"}, "detail": detail}}
+        html = render_signal_card(old)
+        assert "direction not yet decided" in html, f"missed for {detail}"
+        assert ">LONG<" not in html, f"placeholder rendered as a direction for {detail}"
+
+
+def test_the_two_dashboards_use_the_same_fallbacks():
+    """Parity again: a fallback on one side only means the two dashboards disagree about the same
+    signal, which is worse than both being wrong in the same way."""
+    import inspect
+
+    from api import render
+
+    server = inspect.getsource(render)
+    frontend = (Path(__file__).resolve().parents[1] / "frontend" / "lib" / "honesty.ts"
+                ).read_text(encoding="utf-8")
+    for token in ("two_leg", "levels_are", "entry_triggers"):
+        assert token in server, f"{token} fallback missing from render.py"
+        assert token in frontend, f"{token} fallback missing from honesty.ts"

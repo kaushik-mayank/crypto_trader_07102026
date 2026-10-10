@@ -36,7 +36,13 @@ from snapshot.models import MarketSnapshot
 from strategy.act import Direction, act
 from strategy.base import Lifecycle, SetupState, StrategyOutcome, no_setup, setup, terminal, update
 from strategy.conditions import Condition, ConditionContext, ConditionResult, evaluate_all
-from strategy.evaluation import Levels, build_signal, price_now, signal_id
+from strategy.evaluation import (
+    RESIDUAL_BASIS,
+    Levels,
+    build_signal,
+    price_now,
+    signal_id,
+)
 from strategy.lifecycle import Invalidation, advance
 from strategy.market_view import MarketView
 
@@ -389,7 +395,17 @@ class C1C:
              "notional_weight": f"{beta:.4f}",
              "note": "beta-weighted hedge: the notionals differ by design"},
         ]
+        # ``price_basis=RESIDUAL_BASIS`` is load-bearing, not documentation. These numbers are
+        # beta-adjusted log-return spreads: small, and **negative for roughly half of all LONG
+        # setups**, because a long residual trade is entered when the spread sits below what beta
+        # explains. A consumer cannot tell that by looking, and the dashboard rendered
+        # ``entry -0.0414`` under a heading marked *entry* — a price that does not exist on any
+        # exchange, on a card that otherwise looks exactly like a tradeable BTC suggestion (F-051).
+        #
+        # The ``detail`` note below said the same thing in prose and was ignored for weeks, which is
+        # the argument for a field: prose is advice, a field can be branched on.
         return Levels(entry=act_state.e_t, stop=stop, targets=(Decimal(0),),
+                      price_basis=RESIDUAL_BASIS,
                       detail={"levels_are": "residual (spread) units, not price",
                               "residual_sigma": str(sigma), "legs": legs,
                               "target_basis": "the residual returns to its rolling mean, which is "

@@ -34,7 +34,16 @@ $AS_SERVICE git fetch --quiet origin
 LOCAL=$($AS_SERVICE git rev-parse HEAD)
 REMOTE=$($AS_SERVICE git rev-parse origin/main)
 if [ "$LOCAL" = "$REMOTE" ]; then
-  echo "    already up to date"
+  # "Already up to date" is the answer people read as success, and twice now it has meant the
+  # opposite: the code was never pushed, so there was nothing to pull and the VM stayed old while
+  # the dashboard moved on (F-059). Say what it actually proves and what it does not.
+  echo "    already up to date with origin/main"
+  echo
+  echo "    NOTE: this means nothing new has been PUSHED, not that the VM has the newest code."
+  echo "    If a dashboard page is still broken, check on your laptop that the code is committed:"
+  echo "        git status          # must show nothing left to commit"
+  echo "        git push"
+  echo "    then run this script again."
 else
   # Refuse to discard local edits silently. If someone hot-fixed a file on the VM, overwriting it
   # without a word is how a fix disappears and the bug comes back a week later looking new.
@@ -68,6 +77,29 @@ systemctl restart crypto-ingest
 systemctl restart crypto-app
 sleep 5
 systemctl is-active crypto-ingest crypto-app
+
+echo "==> routes the dashboard needs"
+# Checked here as well as in diagnose.sh, because this is the moment someone is watching. An engine
+# that restarts cleanly but does not serve a route the dashboard calls looks entirely healthy from
+# every other angle, and the symptom appears on one page as a 404 that invites a settings hunt.
+TOKEN=$(grep -E '^CT_SERVER__AUTH_TOKEN=' /etc/crypto-trader/env 2>/dev/null | cut -d= -f2- | tr -d '"' || true)
+if [ -n "${TOKEN:-}" ]; then
+  MISSING=""
+  for route in /api/signals/live /api/health /api/candles/B-BTC_USDT /api/sources; do
+    RC=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
+         -H "x-auth-token: $TOKEN" "http://127.0.0.1:8000${route}" 2>/dev/null || echo 000)
+    printf '    %-28s %s\n' "$route" "$RC"
+    [ "$RC" = "404" ] && MISSING="$MISSING $route"
+  done
+  if [ -n "$MISSING" ]; then
+    echo
+    echo "!!! this engine does not serve:$MISSING" >&2
+    echo "!!! the code for those routes is not in the commit above, which means it was never" >&2
+    echo "!!! pushed. On your laptop: git status, then git add -A, git commit, git push." >&2
+  fi
+else
+  echo "    skipped: CT_SERVER__AUTH_TOKEN not readable from /etc/crypto-trader/env"
+fi
 
 echo "==> done"
 $AS_SERVICE git log --oneline -1

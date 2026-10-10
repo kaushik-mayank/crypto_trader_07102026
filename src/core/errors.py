@@ -366,6 +366,23 @@ class ServiceUnavailable(ApiError):
     problem_class = ProblemClass.INFRASTRUCTURE
 
 
+class BadRequest(ApiError):
+    """The caller asked for something that does not exist. **Not** an outage.
+
+    The distinction earns its own class because the problem class is what tells the operator where
+    to look, and getting it wrong wastes the most time at the worst moment. A chart asking for a
+    ``2h`` interval this system does not store is the caller being wrong; reporting that as
+    ``infrastructure`` with a 503 sends someone to check the VM, the firewall and the service logs
+    for a mistake that is entirely in the query string.
+
+    ``configuration`` rather than ``application_bug``: the code is working exactly as written, and
+    the fix is to change what was asked for.
+    """
+
+    code = "API_BAD_REQUEST"
+    problem_class = ProblemClass.CONFIGURATION
+
+
 class RenderError(CryptoTraderError):
     code = "RENDER_FAILURE"
     problem_class = ProblemClass.APPLICATION
@@ -408,7 +425,7 @@ ALL_ERRORS: tuple[type[CryptoTraderError], ...] = (
     StoreError, MigrationError, PointInTimeViolation, IntegrityError, ClockError,
     FeatureError, FeatureNotAvailable, InvalidOHLC,
     RegimeError, StrategyError, SetupNotReady, RiskError, ImmutabilityViolation,
-    AuditError, ReplayMismatch, ApiError, ServiceUnavailable, RenderError,
+    AuditError, ReplayMismatch, ApiError, ServiceUnavailable, BadRequest, RenderError,
     BootstrapError,
     BacktestError, ProtocolViolation,
 )
