@@ -353,3 +353,61 @@ def test_a_venue_failure_mid_fetch_names_the_window_and_says_how_to_resume(store
     assert "re-run the bootstrap" in e.value.remediation
     assert e.value.retryable is True
     assert "start_ms" in e.value.context
+
+
+# ---- the verdict must not move while the run is happening (F-042) --------------------------
+
+def test_the_post_run_check_uses_the_same_window_the_run_planned(store, monkeypatch):
+    """The first deployment reported "3 series, 3 bars missing" and exited non-zero on a run that
+    had fetched everything it set out to fetch.
+
+    The cause: the CLI re-planned at the clock's *current* value, so a run taking a minute ended with
+    its window extended by a minute — and the bar that closed during the run, which was never in the
+    plan, counted as missing. Because the exit code follows that comparison, the command reported
+    failure and the health check warned permanently about nothing.
+
+    Asserted on the arithmetic rather than through the CLI: with a window ending at ``now``, a plan
+    recomputed at ``now`` must agree with itself, while one recomputed later must not.
+    """
+    now = T0 + 300 * H
+    depth = live_depth(100)
+    times = set(range(now - depth * H, now, H))
+    client = FakeClient(times)
+    request = request_for((Timeframe.H1, 100))
+
+    run_job(store, client, plan(store, request, now_ms=now).jobs[0], now_ms=now,
+            verify_fraction=0.0)
+
+    # The honest question: did the run fetch what it planned to?
+    assert plan(store, request, now_ms=now).complete
+
+    # The misleading one: has anything closed since? Of course it has, and that is the live ingest
+    # process's job, not the bootstrap's.
+    later = plan(store, request, now_ms=now + 3 * H)
+    assert not later.complete
+    assert later.missing_total == 3, "exactly the bars that closed after the run was planned"
+
+
+def test_the_cli_reports_success_on_a_run_that_fetched_everything(store, monkeypatch, tmp_path):
+    """End to end through ``main()``, because the exit code is what the health check reads."""
+    import bootstrap.__main__ as cli
+
+    now = T0 + 300 * H
+    depth = live_depth(100)
+    times = set(range(now - depth * H, now, H))
+    request = request_for((Timeframe.H1, 100))
+
+    monkeypatch.setattr(cli, "build_request", lambda: request)
+    monkeypatch.setattr(cli, "open_store", lambda *a, **kw: store)
+    monkeypatch.setattr(cli, "IngestClient", lambda *a, **kw: FakeClient(times))
+    monkeypatch.setattr(cli, "OUT", tmp_path / "bootstrap.json")
+    monkeypatch.setattr(cli, "setup_logging", lambda *a, **kw: None)
+
+    # An *advancing* clock: the first reading is when the run starts, later readings are hours on.
+    # That is what a slow run looks like, and it is the condition the bug needed — a frozen clock
+    # cannot reproduce it, because the whole bug was the second reading differing from the first.
+    readings = iter([now / 1000] + [(now + 5 * H) / 1000] * 20)
+    monkeypatch.setattr(cli.time, "time", lambda: next(readings))
+
+    assert cli.main(["--run"]) == 0, (
+        "a run that fetched its whole plan must exit 0 even if hours passed while it ran")

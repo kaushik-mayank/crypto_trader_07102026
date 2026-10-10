@@ -111,14 +111,34 @@ def setup_logging(
         root.addHandler(ch)
 
     if log_dir is not None:
-        log_dir = Path(log_dir)
-        log_dir.mkdir(parents=True, exist_ok=True)
-        fh = logging.handlers.RotatingFileHandler(
-            log_dir / f"{log_name}.jsonl", maxBytes=20_000_000, backupCount=5, encoding="utf-8")
-        fh.setLevel(file_level.upper())
-        fh.setFormatter(structlog.stdlib.ProcessorFormatter(
-            processor=structlog.processors.JSONRenderer(), foreign_pre_chain=shared))
-        root.addHandler(fh)
+        # A log file we cannot write **degrades** the process; it does not kill it.
+        #
+        # This used to raise, and the consequence on a real host was severe out of all proportion to
+        # the cause: a `chown` on the logs directory made the service unable to open its log file, so
+        # it died at startup, systemd restarted it, and it died again — a crash loop whose only
+        # symptom was a dashboard saying the engine did not answer (F-042). Meanwhile the console
+        # handler above was working perfectly and journald was capturing every line.
+        #
+        # Refusing to run because we cannot *write about* running is failing for the wrong reason.
+        # The process continues on console-only logging and says so at WARNING on every start, so
+        # the degradation is loud rather than silent.
+        try:
+            log_dir = Path(log_dir)
+            log_dir.mkdir(parents=True, exist_ok=True)
+            fh = logging.handlers.RotatingFileHandler(
+                log_dir / f"{log_name}.jsonl", maxBytes=20_000_000, backupCount=5, encoding="utf-8")
+        except OSError as e:
+            logging.getLogger("core.logging").warning(
+                "file logging is unavailable; continuing with console logging only. "
+                "path=%s error=%s. The process is running and journald still has every line "
+                "(`journalctl -u <service>`); fix the directory's ownership to restore the JSON "
+                "log files: chown -R <service-user> %s",
+                log_dir, e, log_dir)
+        else:
+            fh.setLevel(file_level.upper())
+            fh.setFormatter(structlog.stdlib.ProcessorFormatter(
+                processor=structlog.processors.JSONRenderer(), foreign_pre_chain=shared))
+            root.addHandler(fh)
 
     # Third-party noise: urllib3 logs every connection at DEBUG, which drowns our own DEBUG lines.
     logging.getLogger("urllib3").setLevel(logging.WARNING)

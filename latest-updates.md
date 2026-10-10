@@ -11,7 +11,7 @@
 | **Next action** | See [Next Action](#next-action). |
 | **Deployment target** | **Azure VM** (engine) + **Vercel** (dashboard) + **Cloudflare tunnel** (the link between them, with no inbound port). GitHub is the source of truth and the VM pulls from it. Step-by-step: **[`HOSTING.md`](HOSTING.md)**. Architecture rationale: [§3A](#3a-azure-architecture-deployment-target) and D-33…D-37. |
 | **Blocking gaps** | **None for implementation.** Three things limit *output*: the regime model is **degraded on BTC and SOL** (F-033), so their dwell-stability conditions are dropped; **Tier B has zero history**, so C1-A and C2-C cannot be backtested at all (specs/09 §13); and nothing has been backtested, so every signal carries `validated: false`. `swing_atr_multiple` is no longer among them — it was calibrated structurally at 0.75 (F-038) and the registry has **zero `unset` parameters**. |
-| **Quality gates** | **728 tests passing** · `ruff` clean · `mypy` clean across 133 source files |
+| **Quality gates** | **732 tests passing** · `ruff` clean · `mypy` clean across 133 source files |
 
 ---
 
@@ -1061,6 +1061,9 @@ against a fresh holdout; API-change drill.
 | **D-35** | The Vercel app is a **server-side proxy**, never a browser calling the engine | The shared token is read inside the proxy route, which runs on Vercel's server, so it never reaches the browser — a `NEXT_PUBLIC_` variable would be compiled into the JavaScript a visitor downloads. Three consequences fall out: the engine needs no CORS, the engine can stay on loopback, and the proxy forwards **GET only against an explicit allow-list**, so a future engine endpoint cannot become publicly reachable by accident |
 | **D-36** | The frontend duplicates the `specs/15` display rules, confined to one file and cross-checked from Python | Duplication is refused everywhere else in this project (one ACT, one trail, one cost model), and this is a real exception. It is accepted because the alternative is passing HTML strings across a network boundary into `dangerouslySetInnerHTML`, which cannot be type-checked at all. The mitigation is that it lives only in `frontend/lib/honesty.ts`, and `tests/test_frontend_contract.py` reads that file as text and asserts its thresholds and colour tokens match `src/api/render.py` — a check that runs in the suite that runs on every change, rather than in a Node toolchain that may not be installed |
 | **D-37** | A fresh host **rebuilds price history from the API**; local data is never copied up | The development database is 5.8 GB, holds the holdout, and is gitignored for that reason. Copying it by hand is a step that can be done wrong silently. `python -m bootstrap` is idempotent by construction — the plan is recomputed from the database each run, so there is no completion marker to go stale — and chunks are fetched **newest-first** so an interrupted run leaves the *recent* history complete, which is the half the live system needs to run at all |
+| **D-38** | A log file the process cannot write **degrades** it; it does not kill it | The first deployment died for this exact reason and crash-looped for hours (F-042). The console handler was working and journald had every line, so the process refused to run because it could not *write about* running. A failure to log is not a failure to work. It is announced at WARNING on every start, naming the path, `journalctl`, and the `chown` that restores the files — loud, but not fatal |
+| **D-39** | The bootstrap's post-run check re-plans at the **same** `now_ms` the run used | Re-planning at the current clock moves the goalposts: a run lasting a minute ends with its window a minute longer, so the bar that closed *during* the run counts as missing. The first deployment reported "3 bars missing" on a complete run, and since the exit code follows that comparison, the command reported failure permanently. The honest question is "did I fetch what I set out to fetch" |
+| **D-40** | Diagnosis on a host is a **script that walks the chain**, not a better error message | F-042's classification was correct at every layer and nobody read it, because the only message reaching the operator — "the engine did not answer" — was four layers downstream of a crash loop. `diagnose.sh` tests ownership, the token, each service *with its restart count* (a crash loop reads as `active` without it), the local API both ways, the tunnel's registration, data, disk and errors, in that order, so the first `FAIL` is the thing to fix |
 | **D-16** | Every ruff ignore carries an inline reason | The ignores are deliberate patterns (long-lived recorder handles, pairwise `zip`, `Kind(str, Enum)`), not unfixed warnings. An unexplained ignore is indistinguishable from neglect |
 
 ---
@@ -1214,6 +1217,20 @@ per D-15 and un-ignored as later phases touch them.
 | `src/core/errors.py` | Added `BootstrapError` (`external_dependency`, retryable) |
 | `.gitignore` | Frontend build output, `node_modules`, `.vercel`, `.env.local` |
 | `tests/` | **New** — `test_bootstrap.py` (19), `test_frontend_contract.py` (12); extended `test_api.py` with the tunnel-guard tests |
+
+### Deployment fixes (2026-10-10)
+
+| Path | Change |
+|---|---|
+| `BUG_SOLVE.md` | **New** — the plain-language recovery guide for the first deployment's failure, written for a non-technical reader |
+| `src/core/logging.py` | File logging degrades instead of raising (D-38) — the fix for the crash loop |
+| `src/bootstrap/__main__.py` | The post-run check uses the run's own `now_ms` (D-39) |
+| `deploy/azure/diagnose.sh` | **New** — walks the whole chain and names the first broken link (D-40) |
+| `deploy/azure/update.sh` | Takes root and steps down to `crypto` for Git and pip; re-asserts ownership every run |
+| `deploy/azure/*.sh` | Committed `100755`; `core.filemode=false` on Windows had swallowed the `chmod` |
+| `HOSTING.md` | The `--profile full` command carries its `sudo -u crypto` prefix; the ownership rule is stated explicitly; the Vercel redeploy requirement is in the step, not only in troubleshooting |
+| `tests/` | Four tests: logging degrades and still announces itself, a writable directory still gets its file handler, the bootstrap's window does not move, and the CLI exits 0 on a complete run under an advancing clock |
+| `docs/findings.md` | **F-042** — the deployment, the four defects, and what the diagnosis layer got wrong |
 
 ## Next Action
 

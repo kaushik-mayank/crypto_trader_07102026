@@ -1164,6 +1164,127 @@ the recent tail to the live `settle:` sweep. To keep that honest rather than mer
 difference, per F-037); any real mismatch fails the run with the window and field named, because
 writing history final on one fetch is only safe if a second fetch agrees.
 
+---
+
+## F-042 — The first real deployment: four defects, and one of them turned a mistake into an outage ✅
+
+**Date:** 2026-10-07 (deployment), 2026-10-10 (analysis and fixes). **Evidence:** the operator's full
+terminal log of an Azure install, start to finish.
+
+The deployment itself worked. The VM came up, the repository cloned, dependencies installed, the
+bootstrap fetched 17,580 bars in 15 requests, both services started `active (running)`, the local API
+returned **401 without a token and 200 with one**, and the tunnel registered. Then the dashboard said
+*"the engine did not answer within 8 seconds"* and stayed that way.
+
+Four defects, in the order they bit.
+
+### 1. A guide line missing its `sudo -u crypto` prefix — the trigger
+
+Every command in `HOSTING.md` that touches `data/` or `logs/` carries that prefix, because the
+services run as `crypto` and those directories belong to `crypto`. One did not: the optional
+`--profile full` note was written as prose rather than as a command block, and so lost it.
+
+```
+$ /opt/crypto-trader/.venv/bin/python -m bootstrap --run --profile full
+PermissionError: [Errno 13] Permission denied: '/opt/crypto-trader/logs/bootstrap.jsonl'
+```
+
+**Fixed:** the note is a proper command block with the prefix, and it is followed by the rule stated
+explicitly — *every* command touching those directories needs it, and a permission error means the
+prefix is missing rather than that ownership needs changing.
+
+### 2. `chown` as the obvious fix — the amplifier
+
+```
+$ sudo chown -R azureuser:azureuser /opt/crypto-trader/logs
+```
+
+Entirely reasonable in isolation, and it hands the directory to the wrong user. From that moment the
+two running services could not write their logs. Then:
+
+```
+$ /opt/crypto-trader/.venv/bin/python -m bootstrap --run --profile full
+BOOTSTRAP FAILED: the database is read-only
+```
+
+Because `data/` still belonged to `crypto` while the command ran as `azureuser` — the mirror image of
+the first error, and a sign the ownership model had been half-inverted.
+
+### 3. **A log file the process could not write killed the process** — the real defect
+
+This is the one worth keeping. `setup_logging` called `mkdir` and opened a `RotatingFileHandler` with
+nothing catching `OSError`, so an unwritable log directory raised during startup. systemd restarted
+the service, it raised again, and it has been looping ever since on `RestartSec=10`.
+
+The console handler was attached and working the whole time. **journald had every line.** The process
+refused to run because it could not *write about* running.
+
+The consequences compounded badly:
+
+* `systemctl is-active` says `active` during the brief window between start and crash, so the
+  services looked healthy;
+* a crash-looping app accepts no connections, so the tunnel had nothing to forward and Cloudflare
+  timed out;
+* the only symptom reaching the operator was the dashboard's *"the engine did not answer"* — true,
+  and four layers away from the cause.
+
+**Fixed:** file logging now degrades. The handler is attempted, `OSError` is caught, and the process
+continues on console logging with a WARNING that names the path, the error, `journalctl` as the place
+the logs still are, and the `chown` that restores the files. A failure to log is not a failure to
+work, and nothing about correctness depends on it.
+
+### 4. The post-run check moved its own goalposts
+
+```
+remaining incomplete: 3 series, 3 bars
+```
+
+on a run that had fetched everything it planned. `bootstrap --main__` re-planned at the clock's
+*current* value, so a run lasting a minute ended with its window a minute longer — and the 1m bar that
+closed **during** the run, never in the plan, counted as missing. Since the exit code follows that
+comparison, the command reported failure and the health check would have warned permanently.
+
+**Fixed:** the re-plan uses the same `now_ms` the run was planned with. The honest question is "did I
+fetch what I set out to fetch"; bars that closed since are the live ingest process's job.
+
+### A fifth, smaller one: the executable bit
+
+```
+$ /opt/crypto-trader/deploy/azure/health-check.sh
+-bash: Permission denied
+```
+
+`core.filemode=false` on Windows meant the `chmod +x` never reached the Git index — the scripts were
+committed `100644`. Fixed with `git update-index --chmod=+x`, and every invocation in the
+documentation now says `bash <script>`, which works either way.
+
+### What this says about the diagnosis layer
+
+The system classifies every failure by owner — application bug, configuration, infrastructure,
+external dependency, data quality, modelling — and that classification worked: the errors were
+correct and specific wherever they were *read*. The gap was that nobody read them, because the only
+message that reached the operator was four layers downstream of the cause, and the one script that
+would have helped could not execute.
+
+So the fix is not a better message; it is a script that walks the chain. `deploy/azure/diagnose.sh`
+tests, in order: directory ownership (including files *inside*, which is how this failure looked),
+the token's presence, each service with its **restart count** (a crash loop reads as `active` without
+it), the local API unauthenticated and authenticated, the tunnel's registration in its own log, the
+price history, the disk, and the error count. The first `FAIL` is the thing to fix.
+
+`update.sh` was also wrong for this host: it ran Git as the invoking user, which trips the "dubious
+ownership" guard on a repository owned by `crypto`. It now takes root and steps down to `crypto` for
+Git and pip, and re-asserts ownership of `data/` and `logs/` on every update — because getting that
+wrong is what caused all of this, and it costs nothing to be sure.
+
+### Confirmed working, for the record
+
+The deployment did prove most of the chain. From an empty database: **17,580 bars, 15 requests**;
+`401` unauthenticated and `200` authenticated on the local API; `active (running)` on all three
+services; the tunnel registered. The engine was sound. The plumbing around it had four holes.
+
+
+
 
 
 

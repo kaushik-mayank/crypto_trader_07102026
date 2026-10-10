@@ -252,9 +252,21 @@ It prints a summary ending in `remaining incomplete: 0 series, 0 bars`.
 missing, and fetches only that. If it is interrupted, run it again — there is nothing to reset. If
 everything is already there, it says so and stops.
 
-> **Optional, for backtesting later:** `bootstrap --run --profile full` fetches everything CoinDCX
-> has (back to 2021). That takes a few hours and about 6 GB, almost all of it minute-by-minute data.
-> You do **not** need it to run the system. Skip it for now.
+> **Optional, for backtesting later**, and **only with the `sudo -u crypto` prefix**:
+>
+> ```bash
+> cd /opt/crypto-trader
+> sudo -u crypto ./.venv/bin/python -m bootstrap --run --profile full
+> ```
+>
+> This fetches everything CoinDCX has (back to 2021): a few hours and about 6 GB, almost all of it
+> minute-by-minute data. You do **not** need it to run the system — skip it for now.
+>
+> **Every command in this guide that touches `data/` or `logs/` must start with `sudo -u crypto`.**
+> Those directories belong to the `crypto` user because the services run as `crypto`. Running one as
+> yourself fails with a permission error, and "fixing" that with `chown` hands the directory to the
+> wrong user and stops the services writing at all. If you have already done that, see
+> [`BUG_SOLVE.md`](BUG_SOLVE.md).
 
 Now start the two services:
 
@@ -368,6 +380,10 @@ curl -s -o /dev/null -w "%{http_code}\n" https://crypto-api.example.com/api/heal
 
 4. **Deploy**. Two minutes later you get a URL like `crypto-trader.vercel.app`.
 
+   > **If you add or change an environment variable later, you must redeploy.** Vercel does not
+   > apply a changed variable to a deployment that already exists — the old value stays live until
+   > you trigger a new build. Deployments → the top one → **⋯** → **Redeploy**.
+
 5. Open it. You should see the dashboard, with a line at the top saying the system never trades.
 
 ---
@@ -375,9 +391,12 @@ curl -s -o /dev/null -w "%{http_code}\n" https://crypto-api.example.com/api/heal
 ## Step 9 — Check everything, then leave it alone for 72 hours
 
 ```bash
-# One command that checks the lot.
-/opt/crypto-trader/deploy/azure/health-check.sh
+# One command that walks the whole chain and names the first broken link.
+bash /opt/crypto-trader/deploy/azure/diagnose.sh
 ```
+
+Run it with `bash` in front, as written. That way it works whether or not the file arrived with its
+executable bit intact.
 
 Every line should say `OK`. Then **stop touching it.**
 

@@ -174,3 +174,49 @@ def test_down_and_quiet_market_are_distinguishable_in_the_report():
                                                 problem_class=E.ProblemClass.EXTERNAL))
     assert quiet.to_dict()["status"] == "HEALTHY" and quiet.to_dict()["degraded_reasons"] == []
     assert broken.to_dict()["status"] == "DOWN" and broken.to_dict()["degraded_reasons"]
+
+
+# ---- logging degrades rather than killing the process (F-042) ------------------------------
+
+def test_an_unwritable_log_directory_degrades_instead_of_killing_the_process(tmp_path, capsys):
+    """The fix for the failure that took the first deployment down.
+
+    A ``chown`` on the logs directory made the service unable to open its log file. ``setup_logging``
+    raised, so the process died at startup, systemd restarted it, and it died again — a crash loop
+    whose only visible symptom was a dashboard saying "the engine did not answer". The console
+    handler was working the whole time and journald had every line.
+
+    Refusing to run because we cannot *write about* running is failing for the wrong reason.
+    """
+    from core.logging import get_logger, setup_logging
+
+    # A file where a directory is expected: mkdir and the file handler both fail with OSError,
+    # which is what an unwritable or wrongly-owned directory produces on a host.
+    blocker = tmp_path / "logs"
+    blocker.write_text("not a directory", encoding="utf-8")
+
+    setup_logging(blocker, log_name="probe")      # must not raise
+    get_logger("test").info("still running")
+
+    # Asserted on stdout rather than through caplog, because setup_logging replaces the root
+    # handlers — pytest's capture handler included. Stdout is also where journald reads from on a
+    # host, so this is the stream that actually carries the warning in production.
+    out = capsys.readouterr().out
+    assert "file logging is unavailable" in out, \
+        "the degradation must be announced at WARNING, not applied silently"
+    # The remediation has to name the action, because the person reading it is looking at a
+    # dashboard that says nothing more useful than "the engine did not answer".
+    assert "journalctl" in out
+    assert "chown" in out
+    assert "still running" in out, "the process must keep logging after the degradation"
+
+
+def test_a_writable_log_directory_still_gets_its_file_handler(tmp_path):
+    """The degradation must not become the normal path: when the directory works, logs go to it."""
+    from core.logging import get_logger, setup_logging
+
+    log_dir = tmp_path / "logs"
+    setup_logging(log_dir, log_name="probe")
+    get_logger("test").info("written to the file")
+    written = (log_dir / "probe.jsonl").read_text(encoding="utf-8")
+    assert "written to the file" in written

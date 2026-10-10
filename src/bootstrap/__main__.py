@@ -110,7 +110,17 @@ def main(argv: list[str] | None = None) -> int:
         summary = run_plan(store, client, current, now_ms=now_ms,
                            verify_fraction=args.verify_fraction)
 
-        after = plan(store, request, now_ms=int(time.time() * 1000), profile=profile)
+        # Re-planned at the **same** ``now_ms`` the run used, not at the clock's current value.
+        #
+        # Using the current time moves the goalposts: a run that takes a minute ends with the window
+        # extended by a minute, so the newest bar — which closed *during* the run and was therefore
+        # never in the plan — counts as missing. The first real deployment reported "3 series, 3 bars
+        # missing" for exactly that reason, and because the exit code follows this comparison, the
+        # command reported failure and the health check warned, permanently, about nothing (F-042).
+        #
+        # The honest question is "did I fetch what I set out to fetch", which needs the original
+        # window. Bars that closed since are the live ingest process's job.
+        after = plan(store, request, now_ms=now_ms, profile=profile)
         _write(summary | {"mode": "run", "profile": profile.value,
                           "plan_before": current.to_dict(), "plan_after": after.to_dict()})
         _print_summary(summary, after)
