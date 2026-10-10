@@ -1283,6 +1283,112 @@ The deployment did prove most of the chain. From an empty database: **17,580 bar
 `401` unauthenticated and `200` authenticated on the local API; `active (running)` on all three
 services; the tunnel registered. The engine was sound. The plumbing around it had four holes.
 
+---
+
+## F-043 — `--serve` evaluated once and then served that frozen moment forever ✅
+
+**Date:** 2026-10-10. **Found by:** reading the second deployment log, where every F-042 fix had
+landed and the engine was demonstrably healthy — then looking at what `--serve` actually does.
+
+```python
+evaluate_once()
+uvicorn.run(app, host=..., port=...)      # blocks forever
+```
+
+One evaluation, then a web server that never returns. The system would have produced a single set of
+suggestions at startup and served **that same evaluation for the whole 72-hour observation run**.
+
+The reason this is worth a finding rather than a one-line fix is how it would have presented. Every
+check in `diagnose.sh` passes: both services `active` with zero restarts, the API answers 401 and
+200, the database is complete, no errors. The dashboard renders. The only moving part would have
+been the freshness envelope's age counter, climbing from seconds to days — which is exactly what
+that envelope exists for, and a poor way to discover that a three-day run measured one moment.
+
+**Fixed** by giving uvicorn a worker thread and keeping the evaluation loop on the main thread. That
+direction is not arbitrary: the writable `sqlite3` connection is opened on the main thread and may
+only be used there, so evaluating on a worker would hit precisely the cross-thread error
+`store/reader.py` was written to avoid. Measured after the fix: **6 evaluations in 75 s** at a 12 s
+interval, against exactly 1 before.
+
+The loop also survives failures — a classified error and an unclassified crash are both logged and
+the loop continues. Stopping would turn a transient data problem into an outage, and an outage is
+the thing nobody is watching for.
+
+### The second bug, which the fix exposed
+
+With uvicorn on a worker thread, `/api/health` immediately returned:
+
+```
+"store": {"status": "DOWN", "detail": "sqlite error: SQLite objects created in a thread ..."}
+```
+
+`AppRunner.health()` queries the **writer's** connection, and the API was calling it from a request.
+Worth being precise: **this was not caused by the threading change.** FastAPI runs *sync* handlers in
+a worker thread regardless, and `/api/health` is `def`, not `async def` — so the dashboard's health
+panel had been reporting the store as `DOWN` with a confusing message all along, while the engine
+wrote perfectly well. Moving uvicorn merely made it reproducible on demand.
+
+**Fixed** with `health(include_store=False)`, which the API passes; the reader reports `store:read`
+from its own per-thread connection instead. That is the more honest number anyway — the writer's
+connection being healthy says nothing about whether a request can read. Verified from a request
+thread: `store:read HEALTHY`, with the two known-degraded regime models (F-033) correctly flagged
+and the overall status `DEGRADED`, which is true.
+
+---
+
+## F-044 — The Cloudflare tunnel is removed; the API is exposed directly behind its token ✅
+
+**Date:** 2026-10-10. **Reason:** the owner could not get the tunnel working after several attempts
+and asked for it gone if a direct connection was possible. It is.
+
+### What changed
+
+`CT_SERVER__HOST=0.0.0.0`, one Azure inbound rule for TCP 8000, and Vercel's `CT_API_BASE` becomes
+`http://<vm-ip>:8000`. The tunnel service, its credential file and every reference are deleted.
+
+**The existing bind guard is the entire safety model and it needed no change**: the app already
+refuses to start on a non-loopback address without a token (`StartupError`, not a warning). So there
+is no configuration in which the port is open and unauthenticated. Verified both ways on a real
+network address — `0.0.0.0` with no token refuses to start; with a token, `401` unauthenticated and
+`200` authenticated from another host on the LAN.
+
+### What the exposure actually costs, measured rather than asserted
+
+The honest loss is **TLS**: the token now crosses the internet in clear. What that token guards:
+
+| | |
+|---|---|
+| Read access to public market prices | yes — data CoinDCX publishes to anyone |
+| Read access to this system's suggestions | yes |
+| Ability to trade | **no.** No such code exists, and `tests/test_normalize_hazards.py` fails the build if an order or wallet path appears in `src/` |
+| Any credential | **no.** The CoinDCX fields are empty (F-019) |
+| Ability to spend the exchange rate budget | **no**, and this one is worth stating because it is not obvious: **the API makes no outbound calls at all.** It reads only the local SQLite. Polling CoinDCX is the ingest process's job, on its own schedule, entirely independent of any request |
+
+So the realistic worst case of a stolen token is someone reading public prices and a set of
+unvalidated suggestions. That is a defensible trade for removing a component the owner could not
+operate — an unmaintainable security control is not a security control.
+
+### What was added rather than assumed
+
+Opening a port without noticing who knocks would be careless, so the API now counts refused requests
+and logs a **summary** every 50 (`api_requests_refused`, with the top source addresses). One line
+per refusal would let a scanner fill the disk, which is a denial of service handed over for free; a
+summary makes the distinction that matters visible — background scanning looks like a handful from
+many addresses, someone working through tokens looks like a rising count from one.
+
+`diagnose.sh` section 5 now checks `CT_SERVER__HOST`, asks the **kernel** what is actually listening
+(`ss -ltn`, the only authority on whether the setting and the running process agree), and reports the
+refusal count.
+
+### The upgrade path, documented and not taken
+
+`HOSTING.md` gains an appendix: a free DuckDNS hostname plus Caddy gives real certificates in about
+ten minutes, after which 443 is the open port and the engine returns to loopback where only Caddy
+reaches it. Recorded because the trade above is reasonable, not ideal, and the owner should be able
+to close it without research.
+
+
+
 
 
 

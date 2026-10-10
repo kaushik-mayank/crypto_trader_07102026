@@ -31,6 +31,10 @@ from core.logging import get_logger
 log = get_logger("api.app")
 COMPONENT = "api.app"
 
+#: Refused requests are logged every this many, as a summary. Never one line each: a
+#: scanner would otherwise fill the disk, which is a denial of service handed over free.
+REFUSAL_LOG_EVERY = 50
+
 #: Live signals change at most once per minute (the 1m trigger cadence), so a short cache is safe.
 LIVE_CACHE_SECONDS = 2.0
 
@@ -143,6 +147,34 @@ def create_app(*, signals: SignalService, market: MarketService, health: HealthS
     cache = ResponseCache()
     app.state.cache = cache
     app.state.auth_token = auth_token
+    app.state.refusals = {"count": 0, "sources": {}, "next_log_at": REFUSAL_LOG_EVERY}
+
+    def _note_refusal(request: Any) -> None:
+        """Count rejected requests and log a summary, never one line per request.
+
+        Worth having once the port is reachable from the internet rather than only through a tunnel:
+        a refused request is normally a scanner, occasionally a misconfigured dashboard, and very
+        occasionally someone working through tokens. The three look identical one at a time and
+        obvious in aggregate, so the aggregate is what gets logged.
+
+        One line per refusal would let a scanner fill the disk, which is a denial of service handed
+        over for free.
+        """
+        state = app.state.refusals
+        state["count"] += 1
+        client = getattr(request, "client", None)
+        host = getattr(client, "host", "unknown") if client else "unknown"
+        state["sources"][host] = state["sources"].get(host, 0) + 1
+        if state["count"] >= state["next_log_at"]:
+            state["next_log_at"] = state["count"] + REFUSAL_LOG_EVERY
+            top = sorted(state["sources"].items(), key=lambda kv: -kv[1])[:5]
+            log.warning(
+                "api_requests_refused", total=state["count"],
+                top_sources=dict(top), distinct_sources=len(state["sources"]),
+                detail="requests arrived without a valid token. A handful is normal on a public "
+                       "port; a steady stream from one address with a rising count means someone "
+                       "is working through tokens, and the token should be rotated",
+                remediation="rotate CT_SERVER__AUTH_TOKEN on the VM and in Vercel, then redeploy")
 
     def respond(result: ServiceResult) -> Any:
         return JSONResponse(result.to_dict(), status_code=status_code_for(result))
@@ -161,6 +193,7 @@ def create_app(*, signals: SignalService, market: MarketService, health: HealthS
             # leaks how much of the token was guessed correctly. That is only worth a few thousand
             # requests to an attacker who can measure it, and the fix is one import.
             if not secrets.compare_digest(supplied, auth_token):
+                _note_refusal(request)
                 return JSONResponse({"error": {"code": "API_UNAUTHORISED",
                                                "message": "a valid x-auth-token header is required"}},
                                     status_code=401)

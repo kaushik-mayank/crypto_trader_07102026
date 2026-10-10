@@ -8,7 +8,7 @@
 #
 # The chain is:
 #
-#   Vercel  ->  Cloudflare tunnel  ->  crypto-app (127.0.0.1:8000)  ->  SQLite  <-  crypto-ingest
+#   Vercel  ->  crypto-app (0.0.0.0:8000)  ->  SQLite  <-  crypto-ingest
 #
 # "The engine did not answer" is true of a break anywhere along it, which is why that message alone
 # is not enough to act on. This script tests each link separately and in order, so the first FAIL is
@@ -70,23 +70,25 @@ else
   TOKEN=$(sudo grep -E '^CT_SERVER__AUTH_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d= -f2-)
   if [ -z "${TOKEN:-}" ]; then
     bad "CT_SERVER__AUTH_TOKEN is empty"
-    note "The app refuses to start without it when a tunnel is declared. Generate one:"
+    note "The app refuses to start on a public address without it. Generate one:"
     note "  $PY -c \"import secrets; print(secrets.token_urlsafe(48))\""
   else
     ok "CT_SERVER__AUTH_TOKEN is set (${#TOKEN} characters)"
     note "Vercel's CT_API_TOKEN must match this exactly. Last 6 characters: ...${TOKEN: -6}"
   fi
+  # On a direct bind the non-loopback address already makes the token mandatory, so this flag
+  # should be false. It exists for a tunnel setup, which this deployment does not use.
   if sudo grep -qE '^CT_SERVER__PUBLIC_VIA_TUNNEL=true' "$ENV_FILE"; then
-    ok "CT_SERVER__PUBLIC_VIA_TUNNEL=true (the token is therefore mandatory)"
+    warn "CT_SERVER__PUBLIC_VIA_TUNNEL=true, but this deployment binds directly"
+    note "Harmless — it only adds a second reason the token is required. Set it to false to match."
   else
-    warn "CT_SERVER__PUBLIC_VIA_TUNNEL is not 'true'"
-    note "Set it, so the app refuses to run unauthenticated behind the tunnel."
+    ok "CT_SERVER__PUBLIC_VIA_TUNNEL is false (correct for a direct bind)"
   fi
 fi
 
 # ---- 3. the three services ------------------------------------------------------------------
 head2 "3. Services"
-for svc in crypto-ingest crypto-app crypto-tunnel; do
+for svc in crypto-ingest crypto-app; do
   if systemctl is-active --quiet "$svc"; then
     since=$(systemctl show -p ActiveEnterTimestamp --value "$svc")
     restarts=$(systemctl show -p NRestarts --value "$svc")
@@ -130,26 +132,59 @@ if [ -n "${TOKEN:-}" ] && [ "$CODE" = "401" ]; then
   fi
 fi
 
-# ---- 5. the tunnel --------------------------------------------------------------------------
-head2 "5. The tunnel (Cloudflare -> this machine)"
-if systemctl is-active --quiet crypto-tunnel; then
-  # cloudflared logs its registered connections. No connection means the token is wrong or outbound
-  # traffic is blocked; a connection but no route means the Public Hostname was never added.
-  if journalctl -u crypto-tunnel --since '10 minutes ago' 2>/dev/null \
-       | grep -qiE 'Registered tunnel connection|Connection .* registered'; then
-    ok "cloudflared has registered a connection to Cloudflare"
+# ---- 5. reachable from outside -------------------------------------------------------------
+head2 "5. Reachable from outside (Vercel -> this machine)"
+BIND=$(sudo grep -E '^CT_SERVER__HOST=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]')
+case "${BIND:-}" in
+  0.0.0.0|"::")
+    ok "CT_SERVER__HOST=$BIND — listening on the network interface, so Vercel can reach it" ;;
+  127.0.0.1|localhost|"")
+    bad "CT_SERVER__HOST is '${BIND:-unset}' — the engine only listens to itself"
+    note "Nothing outside this machine can reach it. Set CT_SERVER__HOST=0.0.0.0 in $ENV_FILE,"
+    note "then: sudo systemctl restart crypto-app" ;;
+  *)
+    warn "CT_SERVER__HOST is '$BIND', which is neither loopback nor 0.0.0.0" ;;
+esac
+
+# What the kernel thinks, which is the only authority on whether the port is actually open.
+if command -v ss >/dev/null 2>&1; then
+  LISTEN=$(ss -ltnH 2>/dev/null | awk '{print $4}' | grep -E ':8000$' | head -1)
+  if [ -n "$LISTEN" ]; then
+    case "$LISTEN" in
+      0.0.0.0:8000|\*:8000|'[::]:8000')
+        ok "the kernel shows port 8000 listening on all interfaces ($LISTEN)" ;;
+      127.0.0.1:8000)
+        bad "port 8000 is listening on loopback only ($LISTEN)"
+        note "The setting and the running process disagree — the app has not been restarted since"
+        note "the setting changed: sudo systemctl restart crypto-app" ;;
+      *) warn "port 8000 is listening on $LISTEN" ;;
+    esac
   else
-    warn "no 'Registered tunnel connection' in the last 10 minutes of the tunnel's log"
-    note "check: journalctl -u crypto-tunnel -n 30 --no-pager"
-    note "If the token is wrong, the log says so plainly."
+    bad "nothing is listening on port 8000 at all"
   fi
-  note "This script cannot see Cloudflare's routing table. Confirm in the dashboard that your"
-  note "tunnel has a Public Hostname whose Service is HTTP -> localhost:8000."
-  note "Then, FROM YOUR LAPTOP (not here), run:"
-  note "  curl -s -o /dev/null -w \"%{http_code}\\n\" https://YOUR-TUNNEL-HOSTNAME/api/health"
-  note "Expect 401. A 502 or a hang means the Public Hostname is missing or points elsewhere."
+fi
+
+IP=$(curl -s --max-time 6 https://api.ipify.org 2>/dev/null || true)
+note ""
+note "This script cannot see Azure's firewall. Confirm in the portal that the VM has an inbound"
+note "rule allowing TCP 8000, then FROM YOUR LAPTOP (not here) run:"
+if [ -n "$IP" ]; then
+  note "  curl -s -o /dev/null -w \"%{http_code}\n\" http://$IP:8000/api/health"
 else
-  bad "crypto-tunnel is not running, so nothing outside this machine can reach the engine"
+  note "  curl -s -o /dev/null -w \"%{http_code}\n\" http://YOUR_VM_IP:8000/api/health"
+fi
+note "Expect 401 — reachable and refusing strangers. A hang means the firewall rule is missing;"
+note "a 200 would mean the port is open AND unauthenticated, which must be fixed immediately."
+
+# Probing is expected on a public port; a rising count from one address is not.
+REFUSED=$(journalctl -u crypto-app --since '1 day ago' 2>/dev/null           | grep -c 'api_requests_refused' || true)
+if [ "${REFUSED:-0}" -gt 0 ]; then
+  warn "$REFUSED refusal summaries in the last day — the port is being probed"
+  note "A handful is normal background noise on any public port. A steady stream from one address"
+  note "means someone is working through tokens: rotate CT_SERVER__AUTH_TOKEN here and in Vercel."
+  note "see: journalctl -u crypto-app --since '1 day ago' | grep api_requests_refused | tail -3"
+else
+  ok "no refusal summaries in the last day"
 fi
 
 # ---- 6. data ---------------------------------------------------------------------------------
@@ -197,8 +232,9 @@ elif [ "$WARN" -ne 0 ]; then
   exit 0
 else
   printf '\033[32mEverything checks out on this machine.\033[0m\n'
-  printf 'If the dashboard still cannot reach it, the break is between Cloudflare and Vercel:\n'
-  printf '  - is CT_API_BASE in Vercel exactly your tunnel hostname, with https:// and no trailing slash?\n'
+  printf 'If the dashboard still cannot reach it, the break is the firewall or Vercel:\n'
+  printf '  - does the Azure network security group allow inbound TCP 8000?\n'
+  printf '  - is CT_API_BASE exactly http://YOUR_VM_IP:8000 — http not https, and no trailing slash?\n'
   printf '  - did you REDEPLOY Vercel after setting the variables? It does not apply them otherwise.\n'
   exit 0
 fi

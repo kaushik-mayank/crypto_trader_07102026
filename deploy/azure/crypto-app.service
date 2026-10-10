@@ -3,6 +3,10 @@
 # Deliberately NOT `Requires=crypto-ingest`. If this crash-loops, ingestion must keep recording —
 # a lost suggestion is recoverable, a lost hour of Tier B history is not. The two are independent
 # on purpose (specs/18).
+#
+# This process serves the API **and** keeps evaluating on a cadence: uvicorn runs on a worker thread
+# while the main thread evaluates (F-043). It must not be replaced by a bare uvicorn invocation,
+# which would serve one frozen evaluation forever.
 [Unit]
 Description=crypto-trader suggestion app and API
 Documentation=file:///opt/crypto-trader/HOSTING.md

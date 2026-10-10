@@ -1,214 +1,225 @@
 # Fixing the dashboard — step by step
 
-**Your VM is on, but the dashboard says "the engine did not answer".** I read your full setup log and
-found what happened. Nothing is seriously wrong and nothing has been lost.
+**Round 2.** Your last run fixed the engine: it is healthy, evaluating, and answering. The only thing
+left was the Cloudflare tunnel, and **we are removing it.** Vercel will now talk to your VM directly.
 
 **About 15 minutes.** Copy each command exactly. If a step's output doesn't match what I describe,
 stop there and tell me what you saw.
 
 ---
 
-## What actually happened
+## First — what your last run proved
 
-One command in my guide was wrong, and that caused everything else.
+Your diagnose output was almost all `OK`, and that matters. These are now settled:
 
-Near the end you ran this, to fetch the full price history:
+| | |
+|---|---|
+| File ownership | `data/` and `logs/` both belong to `crypto` ✅ |
+| All services | running, **0 restarts** — no crash loop ✅ |
+| The engine | 401 without the token, 200 with it ✅ |
+| Price history | complete ✅ |
+| Disk | 8% used ✅ |
+| Errors in the last hour | **zero** ✅ |
 
-```
-/opt/crypto-trader/.venv/bin/python -m bootstrap --run --profile full
-```
-
-It failed with a permission error. **That was my mistake** — my guide printed that line without the
-`sudo -u crypto` prefix that every other command has. The engine runs as a user called `crypto`, and
-only `crypto` is allowed to write into the `data` and `logs` folders. You ran it as yourself, so it
-was refused.
-
-Then, very reasonably, you fixed the permission error:
-
-```
-sudo chown -R azureuser:azureuser /opt/crypto-trader/logs
-```
-
-That gave the `logs` folder to **you** — and took it away from `crypto`. So from that moment the
-engine could no longer write its log file. And here is my second mistake: **the engine treated "I
-can't write a log file" as a fatal error and shut down.** Linux then restarted it, it failed again,
-and it has been going round that loop ever since. That loop is why your dashboard says the engine
-didn't answer.
-
-So there were three separate problems:
-
-| # | Problem | Whose fault |
-|---|---|---|
-| 1 | A command in the guide was missing `sudo -u crypto` | Mine — guide now fixed |
-| 2 | The engine died because it couldn't write a *log file* | Mine — code now fixed |
-| 3 | `chown` handed the `logs` folder to the wrong user | A reasonable fix for problem 1 — you'll undo it below |
-
-**I have already fixed problems 1 and 2 in the code.** You need to do Step 1 to collect those fixes,
-and Step 2 to undo problem 3.
-
-There may also be something unfinished in Cloudflare and Vercel — Steps 4 and 5 check that.
+The engine was never the problem. Only the route from Vercel to it.
 
 ---
 
-## Step 1 — Get the fixed code onto the VM
+## Two more bugs I found while reading your logs
 
-Connect to the VM:
+Both were mine, both are fixed, and **one of them would have wasted your entire 72-hour run.**
+
+### 1. The dashboard would have frozen after one evaluation
+
+`python -m app --serve` evaluated **once**, then started the web server — and the web server never
+returns. So the engine would have produced one set of suggestions at startup and served that same
+frozen moment for three days. The only thing that would have moved on your dashboard is the "data
+age" counter climbing.
+
+It would have looked almost plausible, which is the worst kind of bug. **Fixed:** the web server now
+runs alongside a loop that keeps evaluating. I measured it — 6 evaluations in 75 seconds at a
+12-second interval, where before it was exactly 1.
+
+### 2. The health panel reported your database as broken when it wasn't
+
+A detail of how databases and threads interact: the health check was asking the *writing* connection
+a question from the *reading* side, which that kind of database refuses. So the dashboard would have
+shown your store as `DOWN` with a confusing message while the engine was writing perfectly well.
+
+**Fixed:** the health panel now checks the connection the dashboard actually reads through. After the
+fix it reports honestly — your store healthy, and the two known-degraded regime models flagged as
+degraded, which is true and expected.
+
+---
+
+## Step 1 — Get the fixed code
 
 ```bash
 ssh -i "C:\Users\dksma\Downloads\crypto-vm_key.pem" azureuser@20.193.148.146
 ```
 
-Then:
-
 ```bash
 cd /opt/crypto-trader
 sudo -u crypto git pull
-```
-
-You should see a list of changed files. If it says `Already up to date`, I haven't pushed yet — tell
-me and wait.
-
-Then install anything new:
-
-```bash
 sudo -u crypto ./.venv/bin/pip install --quiet -e .
 ```
 
 ---
 
-## Step 2 — Give the folders back to `crypto`
+## Step 2 — Switch the engine to listen on the network
 
-This is the fix for the actual breakage. One command:
-
-```bash
-sudo chown -R crypto:crypto /opt/crypto-trader/data /opt/crypto-trader/logs
-```
-
-Check it worked:
+Right now the engine only listens to itself, which is why it needed a tunnel. One line changes that.
 
 ```bash
-ls -ld /opt/crypto-trader/data /opt/crypto-trader/logs
+sudo nano /etc/crypto-trader/env
 ```
 
-Both lines must show **`crypto crypto`**. Like this:
+Find this line:
 
 ```
-drwxr-xr-x 2 crypto crypto 4096 Oct  7 18:19 /opt/crypto-trader/data
-drwxr-xr-x 2 crypto crypto 4096 Oct  7 18:22 /opt/crypto-trader/logs
+CT_SERVER__HOST=127.0.0.1
 ```
 
-If either says `azureuser`, run the `chown` command again and look for an error message.
+Change it to:
+
+```
+CT_SERVER__HOST=0.0.0.0
+```
+
+`0.0.0.0` means "listen on the network card" instead of "only to myself". While you are in the file,
+also change this line to `false` (it was for the tunnel, which is going away):
+
+```
+CT_SERVER__PUBLIC_VIA_TUNNEL=false
+```
+
+Save and exit: `Ctrl+O`, `Enter`, `Ctrl+X`.
+
+> **The engine refuses to start on a network address without a token.** That is deliberate. You
+> already have a token set, so this will be fine — but it means there is no way to accidentally end
+> up with an open, password-free port.
 
 ---
 
-## Step 3 — Restart the engine and check it
+## Step 3 — Stop and remove the tunnel
+
+```bash
+sudo systemctl disable --now crypto-tunnel
+sudo rm -f /etc/systemd/system/crypto-tunnel.service /etc/crypto-trader/tunnel-env
+sudo systemctl daemon-reload
+```
+
+Then restart the engine so it picks up the new setting:
 
 ```bash
 sudo systemctl restart crypto-ingest
 sudo systemctl restart crypto-app
-sudo systemctl restart crypto-tunnel
 sleep 15
-systemctl is-active crypto-ingest crypto-app crypto-tunnel
+systemctl is-active crypto-ingest crypto-app
 ```
 
-You want **three lines each saying `active`**.
+You want **two lines saying `active`**.
 
-Now check the engine answers. Two commands:
+Now confirm it is listening on the network rather than just to itself:
 
 ```bash
-# Without a password — this SHOULD be refused. 401 is the correct, healthy answer.
-curl -s -o /dev/null -w "no token: %{http_code}\n" http://127.0.0.1:8000/api/health
+ss -ltn | grep 8000
 ```
 
-```bash
-# With the password — paste your own token between the quotes.
-curl -s -o /dev/null -w "with token: %{http_code}\n" \
-  -H "x-auth-token: PASTE_YOUR_TOKEN_HERE" http://127.0.0.1:8000/api/health
-```
+You want to see **`0.0.0.0:8000`**. If it says `127.0.0.1:8000`, the setting didn't take — check
+Step 2 and restart `crypto-app` again.
 
-| What you want | What it means |
-|---|---|
-| `no token: 401` | The engine is up and refusing strangers. Correct |
-| `with token: 200` | The engine is working |
-
-Forgotten your token? Show it with:
-
-```bash
-sudo grep AUTH_TOKEN /etc/crypto-trader/env
-```
-
-**If you got `no token: 000`**, the engine still isn't running. Find out why:
-
-```bash
-journalctl -u crypto-app -n 40 --no-pager
-```
-
-Send me what that prints.
+You can also delete the tunnel in the Cloudflare dashboard if you like. Nothing depends on it now.
 
 ---
 
-## Step 4 — Check Cloudflare has a route (likely still missing)
+## Step 4 — Open the port in the Azure firewall
 
-Your tunnel is running, but I can't see in your log that you finished the second half of the
-Cloudflare setup. A running tunnel with no route accepts the connection and then has nowhere to send
-it — which looks exactly like the engine not answering.
+1. [portal.azure.com](https://portal.azure.com) → your VM (`crypto-vm`) → **Networking** →
+   **Network settings**
+2. **Add inbound port rule**, and fill in exactly this:
 
-1. Go to **[one.dash.cloudflare.com](https://one.dash.cloudflare.com)**
-2. **Networks** → **Tunnels** → click your tunnel (`crypto-trader`)
-3. Click the **Public Hostname** tab
+   | Field | Value |
+   |---|---|
+   | Source | **Any** |
+   | Source port ranges | `*` |
+   | Destination | **Any** |
+   | Service | **Custom** |
+   | Destination port ranges | `8000` |
+   | Protocol | **TCP** |
+   | Action | **Allow** |
+   | Priority | `110` |
+   | Name | `allow-api` |
 
-**If the list is empty, that is the problem.** Click **Add a public hostname** and fill in:
+3. **Add**
 
-| Field | What to put |
-|---|---|
-| Subdomain | `crypto-api` |
-| Domain | whichever domain Cloudflare offers you |
-| Path | leave empty |
-| Service → Type | **HTTP** (not HTTPS — the engine is plain HTTP on the machine itself) |
-| Service → URL | `localhost:8000` |
+### Why "Any" is the source, and what that actually risks
 
-Click **Save**. Copy the full address it shows you — something like
-`crypto-api.yourdomain.com`. You need it in Step 5.
+Vercel doesn't publish fixed addresses for its servers on the free plan, so the rule can't be
+narrowed to them. **The token is what protects the port.** Being precise about what that means:
 
-### Now test it from your own PC
+**What someone with a stolen token could do:** read public market prices, and read your suggestions.
 
-Open **PowerShell on your laptop** — not the VM:
+**What they could not do:**
+
+- **trade anything.** No code in this project can place, cancel or transfer — there is none, and a
+  test fails the build if an order or wallet address ever appears in it;
+- **steal a credential.** Your CoinDCX fields are empty, because everything this system reads is
+  public;
+- **burn your exchange rate limit.** The web API only reads your local database. It makes no calls
+  out to CoinDCX at all — that's the separate ingest service, on its own schedule.
+
+**The honest downside:** the traffic is plain HTTP, so the token crosses the internet unencrypted.
+Someone sitting on the network path could read it. For what's behind it, that is a fair trade — and
+the engine now logs a summary whenever requests arrive without a valid token, so you'd see it being
+probed. If you want it encrypted, there's an HTTPS upgrade at the end of `HOSTING.md`; it needs a
+free hostname and takes about 10 minutes.
+
+---
+
+## Step 5 — Test it from your own PC
+
+**PowerShell on your laptop** — not the VM:
 
 ```powershell
-curl.exe -s -o NUL -w "%{http_code}`n" https://crypto-api.yourdomain.com/api/health
+curl.exe -s -o NUL -w "%{http_code}`n" http://20.193.148.146:8000/api/health
 ```
 
 | Result | Meaning |
 |---|---|
-| **401** | Correct. The tunnel works and the engine is refusing strangers, as it should |
-| `502` or `530` | The Public Hostname is missing or its Service URL is wrong — redo this step |
-| Hangs, then nothing | Same as above, or the engine is down — go back to Step 3 |
+| **401** | Correct. Reachable, and refusing anyone without the token |
+| Hangs, then nothing | The firewall rule is missing or wrong — redo Step 4 |
+| **200** | **Stop and tell me.** That would mean the port is open with no password |
 
-**Do not continue until you see 401.** Everything in Step 5 depends on this working.
+**Do not go to Step 6 until you see 401.** Everything after this depends on it.
 
 ---
 
-## Step 5 — Check Vercel, then redeploy
+## Step 6 — Point Vercel at the VM and redeploy
 
-Two things to verify, and one that's easy to miss.
+1. **vercel.com** → your project → **Settings** → **Environment Variables**
 
-1. Go to **vercel.com** → your project → **Settings** → **Environment Variables**
+2. Change **`CT_API_BASE`** to exactly this:
 
-2. Check `CT_API_BASE`. It must be **exactly** your tunnel address from Step 4:
+   ```
+   http://20.193.148.146:8000
+   ```
 
    | | |
    |---|---|
-   | ✅ Right | `https://crypto-api.yourdomain.com` |
-   | ❌ Trailing slash | `https://crypto-api.yourdomain.com/` |
-   | ❌ Missing `https://` | `crypto-api.yourdomain.com` |
-   | ❌ A path on the end | `https://crypto-api.yourdomain.com/api` |
+   | ✅ Right | `http://20.193.148.146:8000` |
+   | ❌ `https` | `https://20.193.148.146:8000` — there is no certificate, this will fail |
+   | ❌ Trailing slash | `http://20.193.148.146:8000/` |
+   | ❌ A path on the end | `http://20.193.148.146:8000/api` |
 
-3. Check `CT_API_TOKEN` matches the VM's token **character for character**. Compare against what
-   `sudo grep AUTH_TOKEN /etc/crypto-trader/env` printed in Step 3. A single missing character gives
-   you a dashboard where every panel fails.
+   **`http`, not `https`** — and that is not a security mistake on your part. Your browser still
+   loads the dashboard over HTTPS; only Vercel's *server* speaks plain HTTP to your VM, and browsers
+   don't care what a server does behind the scenes.
 
-4. **Now redeploy — this is the step people miss.** Vercel does *not* apply a changed environment
-   variable to a deployment that already exists. The old value stays live until you build again.
+3. Leave **`CT_API_TOKEN`** alone — it hasn't changed.
+
+4. **Redeploy. This is the step people miss.** Vercel does not apply a changed variable to a
+   deployment that already exists; the old value stays live until you build again.
 
    **Deployments** → the top one → the **⋯** menu → **Redeploy** → **Redeploy**.
 
@@ -216,86 +227,126 @@ Wait two minutes, then open your dashboard.
 
 ---
 
-## Step 6 — One command that checks everything
+## Step 7 — Confirm, then leave it alone
 
-I've added a script that walks the whole chain and tells you which link is broken, instead of the
-vague "the engine did not answer". On the VM:
+On the VM:
 
 ```bash
 bash /opt/crypto-trader/deploy/azure/diagnose.sh
 ```
 
-Note the `bash` at the front — type it exactly like that. (The old `health-check.sh` gave you
-`Permission denied` because files lose their "runnable" flag when they travel through Git from
-Windows. Putting `bash` in front sidesteps that entirely, and I've fixed the flag as well.)
+Section 5 is now about direct access rather than the tunnel, and tells you whether the port is
+genuinely listening on the network.
 
-It prints eight sections with `OK`, `WARN` or `FAIL`. **Fix the first `FAIL`, then run it again.**
-When the machine is healthy it tells you so, and reminds you to check the two Vercel things.
+Then **stop touching it for 72 hours.** That is the whole point of this exercise: finding out what
+breaks when nobody is watching, which is the only way to find that out.
 
-Run this any time something looks wrong. It is the first thing to try, always.
+### Once a day, three commands
 
----
+```bash
+# Still running, and not restarting?
+systemctl is-active crypto-ingest crypto-app
+systemctl show -p NRestarts --value crypto-app
+```
 
-## Two things you saw that are **not** problems
+```bash
+# Anything gone wrong?
+journalctl -u crypto-app -u crypto-ingest --since '1 day ago' | grep '"level": *"error"' | tail -20
+```
 
-### "remaining incomplete: 3 series, 3 bars"
+```bash
+# Price data still current? Should say 0 bars missing.
+cd /opt/crypto-trader && sudo -u crypto ./.venv/bin/python -m bootstrap --check | tail -3
+```
 
-Your bootstrap run ended with that message. **Nothing was wrong.** The run took about a minute, and
-during that minute one new one-minute candle closed on the exchange. The check at the end compared
-against the clock *after* the run, so that brand-new candle counted as missing.
+### What counts as a problem, and what doesn't
 
-It was my bug — a misleading message and a false failure. Fixed: the check now compares against the
-same moment the run was planned for. Newer candles are the live ingest service's job, and it picks
-them up within a minute.
+| What you see | Is it a problem? |
+|---|---|
+| `No suggestions right now` | **No.** A quiet market is the normal state. Most hours have nothing to say |
+| The data age sitting at a few seconds and resetting | **No** — that is the fix from this round working |
+| A few `DQ_STALE` errors | **No.** A source was briefly late and the engine declined to guess |
+| A few `api_requests_refused` summaries | **No.** Background scanning of a public port. Normal |
+| A *rising* stream of `api_requests_refused` from one address | **Yes.** Someone is guessing tokens — rotate it (below) |
+| `NRestarts` climbing | **Yes.** `journalctl -u crypto-app -n 40 --no-pager` |
+| Data age climbing past 10 minutes and never resetting | **Yes.** The evaluation loop has stopped |
+| Disk above 85% | **Yes.** The database grows ~2 GB/month |
 
-### "no token: 401"
+### Rotating the token, if you ever need to
 
-A 401 looks like an error and is the opposite. It means a stranger with no password was correctly
-turned away. If that ever shows **200**, something is wrong — the engine would be open to anyone.
+```bash
+/opt/crypto-trader/.venv/bin/python -c "import secrets; print(secrets.token_urlsafe(48))"
+sudo nano /etc/crypto-trader/env     # paste it over CT_SERVER__AUTH_TOKEN
+sudo systemctl restart crypto-app
+```
 
----
-
-## About your CoinDCX API key — don't add it
-
-You mentioned you have a key and secret and haven't entered them anywhere. **That's the right call.
-Leave them out.** Three reasons:
-
-1. **Every piece of data this system reads is public.** We tested this specifically. The endpoint the
-   vendor's documentation says needs a password actually returns everything to a plain, unauthenticated
-   request. The key would add nothing.
-
-2. **It wouldn't fix the missing data anyway.** The data we can't get historically — funding rates,
-   positioning, the order book — isn't withheld behind a login. The exchange simply doesn't offer a
-   "give me last year's funding rates" endpoint to anyone. A key can't create history that was never
-   published. That data only accumulates from now on, while the engine runs.
-
-3. **An unused key is safer than a used one.** A key stored on a server is a key that can leak. This
-   system has no code that could place, cancel or transfer anything — so right now a leak of your
-   server costs you nothing at all. Keep it that way.
-
-If you ever do need one for something, make a **fresh** key with **trading and withdrawal permissions
-switched off**. Never use one that can trade.
+Then update `CT_API_TOKEN` in Vercel to match and **redeploy**.
 
 ---
 
-## Rules that stop this happening again
+## Your CoinDCX API key — still don't add it
 
-**Every command touching `data` or `logs` starts with `sudo -u crypto`.** That's the whole lesson. If
-you see a permission error, it almost always means that prefix was missing — add it and run again.
+Nothing has changed here. Leave it out:
 
-**Never run `chown` to fix a permission error on this project.** It looks like the fix and it's the
-thing that breaks the engine. The folders must stay owned by `crypto`.
+1. **Every piece of data this system reads is public.** We tested the one endpoint the vendor docs
+   claim needs a password — it returns everything to a plain, unauthenticated request.
+
+2. **It wouldn't give us the missing data anyway.** What we lack historically — funding rates,
+   positioning, the order book — isn't withheld behind a login. The exchange publishes no "give me
+   last year's funding rates" endpoint to *anyone*. A key cannot create history that was never
+   published. That data only accumulates from now on, while your engine runs.
+
+3. **An unused key can't leak.** Right now a complete compromise of your VM costs you nothing,
+   because there is nothing there to take. That is worth keeping.
+
+If you ever do need one, make a **fresh** key with trading and withdrawal **switched off**.
+
+---
+
+## Two small housekeeping notes from your log
+
+**Your SSH stopped working for a while** because your home internet address changed
+(`106.192.48.69` → `106.222.206.143`) and the firewall rule still allowed the old one. You fixed it
+correctly. It will happen again whenever your router gets a new address — same fix: VM →
+**Networking** → the `SSH` rule → **Source** → **My IP address** → Save.
+
+**The VM says `*** System restart required ***`** from security updates. Worth doing before the
+72-hour run starts, so it doesn't interrupt it:
+
+```bash
+sudo apt-get update && sudo apt-get upgrade -y
+sudo reboot
+```
+
+Wait two minutes, reconnect, and confirm both services came back on their own:
+
+```bash
+systemctl is-active crypto-ingest crypto-app
+```
+
+Both should say `active` without you starting anything — that is what `enable` was for, and it's
+worth proving once.
+
+---
+
+## The rules that keep this working
+
+**Every command touching `data` or `logs` starts with `sudo -u crypto`.** A permission error almost
+always means that prefix was missing.
+
+**Never run `chown` to fix a permission error here.** It looks like the fix and it's what broke the
+engine last time.
 
 **After changing anything in Vercel, redeploy.** Settings alone do nothing.
 
-**When something looks wrong, run the diagnose script first.** It's faster than guessing and it tells
-you which of the four possible causes you're looking at.
+**When something looks wrong, run `diagnose.sh` first.** It names the broken link instead of making
+you guess.
 
 ---
 
 ## If you're still stuck
 
-Run these three and send me all the output:
+Run these and send me everything:
 
 ```bash
 bash /opt/crypto-trader/deploy/azure/diagnose.sh
@@ -306,8 +357,8 @@ journalctl -u crypto-app -n 60 --no-pager
 ```
 
 ```bash
-ls -ld /opt/crypto-trader/data /opt/crypto-trader/logs
+ss -ltn | grep 8000
 ```
 
-And from your laptop, the result of the `curl.exe` command in Step 4. With those four things I can
-tell you exactly where the chain is broken.
+And from your laptop, the result of the `curl.exe` command in Step 5. With those four I can tell you
+exactly where the chain is broken.

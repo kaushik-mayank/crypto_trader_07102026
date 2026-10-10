@@ -22,6 +22,7 @@ from audit.trail import AuditTrail
 from config.parameters import load_registry
 from config.settings import Settings
 from core.errors import ALL_ERRORS, StartupError
+from core.health import HealthReport
 from core.logging import get_logger, setup_logging
 from features.engine import FeatureEngine
 from normalize.canonical import Product, Timeframe
@@ -72,6 +73,104 @@ def build_runner(store: Any, settings: Settings) -> AppRunner:
     return runner
 
 
+def _serve(runner: AppRunner, settings: Settings, evaluate_once: Any, *,
+           interval_s: float) -> int:
+    """Serve the API **and keep evaluating** on a cadence.
+
+    The two have to happen together, and getting that wrong is subtle enough to be worth spelling
+    out. The first version called ``uvicorn.run()`` after a single evaluation; ``uvicorn.run()``
+    blocks forever, so the system produced one set of suggestions at startup and then served that
+    same frozen evaluation indefinitely. On a 72-hour observation run you would have watched one
+    moment for three days, and the only thing on the dashboard that moved would have been the age
+    counter — which is precisely why the freshness envelope exists, but it is a poor way to find out
+    (F-043).
+
+    **uvicorn runs on a worker thread and the evaluation loop keeps the main thread.** That ordering
+    is deliberate: the writable SQLite connection was opened on the main thread, and a ``sqlite3``
+    connection may only be used by the thread that created it. Running the evaluation on a worker
+    would hit exactly the error that ``store/reader.py`` was written to avoid. The API's reads go
+    through :class:`store.reader.ReadOnlyStore`, which already opens one read-only connection per
+    thread, so the worker serves happily from its own.
+    """
+    import signal
+    import threading
+
+    import uvicorn
+
+    reader = ReadOnlyStore(settings.paths.state_db)
+
+    def api_health() -> Any:
+        """Health for a request thread: the runner's view, plus the API's *own* read connection.
+
+        ``include_store=False`` because the writer's sqlite connection belongs to the main thread
+        and a sync handler runs in a worker — querying it from a request is the cross-thread error
+        in F-043. The reader's own check replaces it and is the more useful number: it tests the
+        connection this request would actually read through.
+        """
+        report = runner.health(include_store=False)
+        return HealthReport(components=[reader.health(), *report.components])
+
+    signals, market, health = build_services(reader, health_source=api_health)
+    app = create_app(signals=signals, market=market, health=health,
+                     host=settings.server.host, auth_token=settings.server.auth_token,
+                     public_via_tunnel=settings.server.public_via_tunnel,
+                     regimes_source=lambda: {a: c.stats() for a, c in runner.classifiers.items()})
+
+    config = uvicorn.Config(app, host=settings.server.host, port=settings.server.port,
+                            log_level="warning")
+    server = uvicorn.Server(config)
+    # No need to disable uvicorn's signal handling: it checks for the main thread itself and skips
+    # installation on a worker, because `signal.signal` only works on the main thread. So the loop
+    # below owns shutdown for both, which is what we want — the server must not stop while an
+    # evaluation is mid-write.
+    thread = threading.Thread(target=server.run, name="uvicorn", daemon=True)
+    thread.start()
+
+    stopping = threading.Event()
+
+    def stop(signum: int, _frame: Any) -> None:
+        log.info("shutdown_requested", signal=signum,
+                 detail="finishing the current evaluation, then stopping")
+        stopping.set()
+        server.should_exit = True
+
+    for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
+        if sig is not None:
+            try:
+                signal.signal(sig, stop)
+            except (OSError, ValueError):            # pragma: no cover - platform guard
+                pass
+
+    log.info("serving", host=settings.server.host, port=settings.server.port,
+             interval_s=interval_s,
+             detail="the API is served on a worker thread while this thread keeps evaluating")
+
+    while not stopping.is_set():
+        started = time.monotonic()
+        try:
+            evaluate_once()
+        except ALL_ERRORS as e:
+            # One failed evaluation must not end the run. The runner already records the failure and
+            # health already reports it; stopping here would turn a transient data problem into an
+            # outage, and an outage is what nobody is watching for.
+            log.error("evaluation_failed", error=e.to_dict(),
+                      detail="the loop continues; health reports this")
+        except Exception as e:                        # noqa: BLE001 - the loop must survive
+            log.error("evaluation_crashed", error=str(e), error_type=type(e).__name__,
+                      detail="unclassified failure; the loop continues so the API stays up")
+        if not thread.is_alive() and not stopping.is_set():
+            log.error("api_thread_died",
+                      detail="the API stopped serving while the evaluation loop was running")
+            return 1
+        # Sleep the remainder of the interval, so a slow evaluation does not push the cadence out.
+        stopping.wait(max(0.0, interval_s - (time.monotonic() - started)))
+
+    server.should_exit = True
+    thread.join(timeout=10)
+    log.info("stopped", evaluations=runner.evaluations)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="crypto-trader suggestion engine")
     ap.add_argument("--serve", action="store_true", help="serve the dashboard after each evaluation")
@@ -115,18 +214,7 @@ def main(argv: list[str] | None = None) -> int:
         return result
 
     if args.serve:
-        import uvicorn
-
-        reader = ReadOnlyStore(settings.paths.state_db)
-        signals, market, health = build_services(reader, health_source=runner.health)
-        app = create_app(signals=signals, market=market, health=health,
-                         host=settings.server.host, auth_token=settings.server.auth_token,
-                         public_via_tunnel=settings.server.public_via_tunnel,
-                         regimes_source=lambda: {a: c.stats() for a, c in runner.classifiers.items()})
-        evaluate_once()
-        log.info("serving", host=settings.server.host, port=settings.server.port)
-        uvicorn.run(app, host=settings.server.host, port=settings.server.port, log_level="warning")
-        return 0
+        return _serve(runner, settings, evaluate_once, interval_s=args.interval)
 
     while True:
         result = evaluate_once()

@@ -14,13 +14,9 @@ needs a decision, the decision is explained and a recommendation given.
       Vercel  (the dashboard — public, free)
               │  server-side, carries the shared token
               ▼
-   Cloudflare tunnel  (no open ports)
-              │
-              ▼
-      Azure VM  (the engine — private)
+      Azure VM  (the engine)
          ├── crypto-ingest   fetches prices, writes the database
-         ├── crypto-app      works out suggestions, serves the API
-         └── crypto-tunnel   lets Vercel in, without opening a port
+         └── crypto-app      works out suggestions, serves the API on port 8000
 ```
 
 ---
@@ -45,10 +41,9 @@ Treat everything on the dashboard as something to watch, not something to act on
 | An Azure account | Runs the engine | ~$20–35/month, or free for 12 months on a new account |
 | A GitHub account | You already have this; the code lives there | Free |
 | A Vercel account | Hosts the dashboard | Free |
-| A Cloudflare account | The tunnel, so no port is ever opened | Free |
 
-You do **not** need: a domain name, a CoinDCX API key (nothing this system reads needs one), Docker,
-or any paid tier of anything except the VM.
+You do **not** need: a Cloudflare account, a domain name, a CoinDCX API key (nothing this system
+reads needs one), Docker, or any paid tier of anything except the VM.
 
 ---
 
@@ -116,7 +111,7 @@ ssh -i "$HOME\Downloads\crypto-vm-key.pem" azureuser@YOUR_VM_IP
 
 It will ask `Are you sure you want to continue connecting?` → type `yes`.
 
-You are now on the server. Everything from here until Step 7 happens in this window.
+You are now on the server. Everything from here until Step 8 happens in this window.
 
 ---
 
@@ -221,8 +216,8 @@ sudo chmod 640 /etc/crypto-trader/env
 The engine holds no credentials and can't trade, so a leak costs you nothing directly. The token is
 there because an open API is an open invitation: anyone who found it could read it as fast as they
 liked and spend your CoinDCX rate budget, which would make *your* data stop updating. The engine
-**refuses to start** without a token once you tell it a tunnel is in front of it, which the template
-already does.
+**refuses to start** without a token on any address other than its own, so there is no
+configuration in which the port is open and unauthenticated.
 
 ---
 
@@ -300,59 +295,82 @@ You want `no token: 401` and `with token: 200`.
 
 ---
 
-## Step 7 — The tunnel, so Vercel can reach the engine
+## Step 7 — Open the port so Vercel can reach the engine
 
-A tunnel means the VM dials *out* to Cloudflare, and traffic comes back down that connection. **No
-inbound port is ever opened.** That is why the firewall can stay closed.
+Vercel's servers need to reach the engine. Two small jobs: tell the engine to listen on the network,
+and tell the Azure firewall to let that one port through.
 
-1. Go to [one.dash.cloudflare.com](https://one.dash.cloudflare.com) → **Networks** → **Tunnels** →
-   **Create a tunnel** → **Cloudflared** → name it `crypto-trader` → **Save**.
-
-2. Cloudflare shows an install command containing a long token. **Copy just the token** (the long
-   string after `--token`).
-
-3. On the VM:
+### 7a. Tell the engine to listen on the network
 
 ```bash
-# Install cloudflared.
-curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-  -o /tmp/cloudflared
-sudo install -m 755 /tmp/cloudflared /usr/local/bin/cloudflared
-
-# Store the tunnel token. THIS ONE IS A REAL SECRET.
-sudo cp /opt/crypto-trader/deploy/azure/tunnel-env.example /etc/crypto-trader/tunnel-env
-sudo nano /etc/crypto-trader/tunnel-env
-# paste the token after CLOUDFLARE_TUNNEL_TOKEN=  then Ctrl+O, Enter, Ctrl+X
-
-sudo chown root:crypto /etc/crypto-trader/tunnel-env
-sudo chmod 640 /etc/crypto-trader/tunnel-env
-
-sudo cp /opt/crypto-trader/deploy/azure/crypto-tunnel.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now crypto-tunnel
-sleep 10
-systemctl status crypto-tunnel --no-pager | head -5
+sudo nano /etc/crypto-trader/env
 ```
 
-4. Back in Cloudflare, on your tunnel → **Public Hostname** tab → **Add a public hostname**:
+Find this line and change `127.0.0.1` to `0.0.0.0`:
+
+```
+CT_SERVER__HOST=0.0.0.0
+```
+
+`0.0.0.0` means "listen on the machine's network card" rather than "only to myself". Save with
+`Ctrl+O`, `Enter`, `Ctrl+X`, then restart:
+
+```bash
+sudo systemctl restart crypto-app
+```
+
+> **The engine refuses to start on a public address without a token.** That is deliberate and not
+> optional — an open port with no password is not a supported configuration, so the process simply
+> will not come up in one. If you ever see it fail to start after this change, check that
+> `CT_SERVER__AUTH_TOKEN` is filled in.
+
+### 7b. Let the port through the Azure firewall
+
+1. [portal.azure.com](https://portal.azure.com) → your VM → **Networking** →
+   **Network settings**
+2. **Add inbound port rule**:
 
    | Field | Value |
    |---|---|
-   | Subdomain | `crypto-api` |
-   | Domain | pick any domain Cloudflare offers you |
-   | Service → Type | `HTTP` |
-   | Service → URL | `localhost:8000` |
+   | Source | **Any** |
+   | Source port ranges | `*` |
+   | Destination | **Any** |
+   | Service | **Custom** |
+   | Destination port ranges | `8000` |
+   | Protocol | **TCP** |
+   | Action | **Allow** |
+   | Priority | `110` |
+   | Name | `allow-api` |
 
-   **Save**. Cloudflare shows you the full address, e.g. `crypto-api.example.com`. Copy it.
+3. **Add**
 
-5. Check it works from your laptop (not the VM):
+Source has to be `Any` because Vercel does not publish fixed addresses for its servers on the free
+plan, so the rule cannot be narrowed to them. **The token is what protects the port**, and
+[`deploy/azure/nsg-rules.md`](deploy/azure/nsg-rules.md) sets out exactly what that does and does not
+risk. The short version: a stolen token gets someone read access to public market prices and your
+suggestions. It gets them no ability to trade, no credential, and no way to spend your exchange rate
+budget — the API reads only the local database and makes no outbound calls at all.
 
-```bash
-# Should be 401 — reachable, and refusing anyone without the token. That is correct.
-curl -s -o /dev/null -w "%{http_code}\n" https://crypto-api.example.com/api/health
+The traffic is plain HTTP, so **the token crosses the internet unencrypted.** That is the real cost of
+not using a tunnel. If that is not acceptable to you, there is an HTTPS upgrade at the end of this
+guide; it needs a hostname.
+
+### 7c. Check it from your own PC
+
+Get the VM's public address from its page in the portal (**Public IP address**), then in
+**PowerShell on your laptop** — not the VM:
+
+```powershell
+curl.exe -s -o NUL -w "%{http_code}`n" http://YOUR_VM_IP:8000/api/health
 ```
 
----
+| Result | Meaning |
+|---|---|
+| **401** | Correct. Reachable, and refusing anyone without the token |
+| Hangs, then nothing | The firewall rule is missing or wrong — redo 7b |
+| `200` | **Stop.** The port is open *and* unauthenticated. Check `CT_SERVER__AUTH_TOKEN` in `/etc/crypto-trader/env`, then restart `crypto-app` |
+
+**Do not continue until you see 401.**
 
 ## Step 8 — Deploy the dashboard to Vercel
 
@@ -371,8 +389,12 @@ curl -s -o /dev/null -w "%{http_code}\n" https://crypto-api.example.com/api/heal
 
    | Name | Value |
    |---|---|
-   | `CT_API_BASE` | `https://crypto-api.example.com` (your tunnel address, no trailing slash) |
+   | `CT_API_BASE` | `http://YOUR_VM_IP:8000` — **`http`, not `https`**, and no trailing slash |
    | `CT_API_TOKEN` | the token from Step 5 |
+
+   `http` rather than `https` is correct here and is not a mistake: the engine serves plain HTTP and
+   only Vercel's *server* talks to it. Your browser never does, so there is no mixed-content problem
+   — the page you load is still HTTPS.
 
    Neither name starts with `NEXT_PUBLIC_`, and that is deliberate: a `NEXT_PUBLIC_` variable gets
    compiled into the JavaScript your browser downloads, so the token would be readable by anyone who
@@ -408,7 +430,7 @@ running continuously, and neither would have been found on a laptop that sleeps.
 
 ```bash
 # Still running?
-systemctl is-active crypto-ingest crypto-app crypto-tunnel
+systemctl is-active crypto-ingest crypto-app
 
 # Anything gone wrong in the last day?
 journalctl -u crypto-app -u crypto-ingest --since '1 day ago' | grep '"level": *"error"' | tail -20
@@ -424,7 +446,7 @@ cd /opt/crypto-trader && sudo -u crypto ./.venv/bin/python -m bootstrap --check 
 | `No suggestions right now` | **No.** A quiet market is the normal state. Most hours have nothing to say |
 | `Warming up` for the first few hours | **No.** Some measurements need 60 days of history and the counters restart on a fresh install |
 | A few `error` lines mentioning `DQ_STALE` | **No.** A data source was briefly late and the engine declined to guess. That is the design |
-| `Cannot tell — the engine did not answer` | **Yes.** Check `systemctl status crypto-app crypto-tunnel` |
+| `Cannot tell — the engine did not answer` | **Yes.** Run `bash /opt/crypto-trader/deploy/azure/diagnose.sh` |
 | A service showing `inactive` or `failed` | **Yes.** `journalctl -u crypto-app -n 50` will say why |
 | Disk above 85% | **Yes.** The database grows ~2 GB/month |
 
@@ -453,22 +475,20 @@ The Vercel dashboard updates itself: it redeploys on every push to `main`, with 
 
 ### The dashboard says "Cannot tell — the engine did not answer"
 
-Work from the outside in:
+One command, which walks the whole chain and names the first broken link:
 
 ```bash
-# 1. Is the tunnel up?
-systemctl status crypto-tunnel --no-pager | head -5
-
-# 2. Is the app up?
-systemctl status crypto-app --no-pager | head -5
-
-# 3. Does the app answer locally? Expect 401.
-curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/api/health
+bash /opt/crypto-trader/deploy/azure/diagnose.sh
 ```
 
-If step 3 answers but the dashboard still cannot see it, the problem is between Cloudflare and
-Vercel: check that `CT_API_BASE` in Vercel exactly matches your tunnel address, with `https://` and
-no trailing slash.
+If that says everything on the machine is fine, the break is the firewall or Vercel:
+
+- does the Azure network security group allow inbound **TCP 8000**? (Step 7b)
+- from your laptop, does a request to `http://YOUR_VM_IP:8000/api/health` return **401**? If it
+  hangs instead, the firewall rule is the problem;
+- is `CT_API_BASE` exactly `http://YOUR_VM_IP:8000` — `http` not `https`, no trailing slash, and no
+  `/api` on the end?
+- did you **redeploy** Vercel after setting the variables?
 
 ### The dashboard says the token is wrong (401 on every panel)
 
@@ -514,7 +534,6 @@ one command.
 | Setting | Where | Secret? |
 |---|---|---|
 | `CT_SERVER__AUTH_TOKEN` | `/etc/crypto-trader/env` on the VM | **Yes** — shared with Vercel |
-| `CLOUDFLARE_TUNNEL_TOKEN` | `/etc/crypto-trader/tunnel-env` on the VM | **Yes** — a real credential |
 | `CT_API_TOKEN` | Vercel → Settings → Environment Variables | **Yes** — the same value as the first |
 | `CT_API_BASE` | Vercel → Settings → Environment Variables | No |
 | Everything else (`CT_PATHS__*`, `CT_SERVER__HOST`) | `/etc/crypto-trader/env` | No |
@@ -537,3 +556,42 @@ Worth being straight about:
 - **The 72-hour run tests the plumbing, not the ideas.** It answers "does this stay up and tell the
   truth", which is worth knowing and has never been established. It does not answer "does this
   make money".
+
+---
+
+## Appendix — upgrading to HTTPS (optional)
+
+Everything above works over plain HTTP, which means the shared token crosses the internet
+unencrypted. For what this system exposes — public market prices and your suggestions, with no
+trading capability and no credentials behind it — that is a reasonable trade, and the token can be
+rotated in two minutes if the log shows it being probed.
+
+If you would rather encrypt it, you need **a hostname**, because a certificate is issued to a name
+and not to an IP address. The shape of it:
+
+1. Get a free subdomain from [duckdns.org](https://www.duckdns.org) pointing at your VM's IP — say
+   `yourname.duckdns.org`.
+2. On the VM, install Caddy (it obtains and renews certificates by itself):
+
+   ```bash
+   sudo apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl
+   curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key      | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+   curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt      | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+   sudo apt-get update && sudo apt-get install -y caddy
+   ```
+
+3. Replace `/etc/caddy/Caddyfile` with three lines:
+
+   ```
+   yourname.duckdns.org {
+       reverse_proxy localhost:8000
+   }
+   ```
+
+4. `sudo systemctl restart caddy`
+5. In the Azure firewall, **add 443 and remove 8000**. Then set `CT_SERVER__HOST` back to
+   `127.0.0.1` and restart `crypto-app`, so only Caddy can reach it.
+6. In Vercel, change `CT_API_BASE` to `https://yourname.duckdns.org` and **redeploy**.
+
+After that the port exposed to the internet is 443, the traffic is encrypted, and the engine is back
+on loopback where only Caddy reaches it. Certificates renew on their own.

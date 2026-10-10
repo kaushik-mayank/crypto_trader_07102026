@@ -9,9 +9,9 @@
 | **Overall status** | **The system runs end to end locally and all 14 strategies are implemented.** `python -m app --once` evaluates 12 tradeable strategies across 3 assets in ~820 ms and writes the audit trail; `python -m ingest` keeps SQLite current; `python -m backtest` has a pre-registered protocol and a complete fill/accounting/metrics stack. **No backtest has produced results yet**, so nothing is validated and every signal still carries `validated: false` and the 0.4 multiplier. |
 | **Current phase** | **Hosting**, by owner instruction on 2026-10-04: the system goes to Azure in suggestion-only mode for a 72-hour observation run while the backtest's data problems are fixed in parallel. `PHASE-26` is complete and the protocol is locked; `PHASE-27` (harness integrity, a halt gate) is next for validation and is independent of hosting |
 | **Next action** | See [Next Action](#next-action). |
-| **Deployment target** | **Azure VM** (engine) + **Vercel** (dashboard) + **Cloudflare tunnel** (the link between them, with no inbound port). GitHub is the source of truth and the VM pulls from it. Step-by-step: **[`HOSTING.md`](HOSTING.md)**. Architecture rationale: [§3A](#3a-azure-architecture-deployment-target) and D-33…D-37. |
+| **Deployment target** | **Azure VM** (engine; API on port 8000 behind its token) + **Vercel** (dashboard, server-side proxy). The Cloudflare tunnel was removed on 2026-10-10 (F-044) — the owner could not operate it, and an unmaintainable security control is not one. GitHub is the source of truth and the VM pulls from it. Step-by-step: **[`HOSTING.md`](HOSTING.md)**; recovery: **[`BUG_SOLVE.md`](BUG_SOLVE.md)**. |
 | **Blocking gaps** | **None for implementation.** Three things limit *output*: the regime model is **degraded on BTC and SOL** (F-033), so their dwell-stability conditions are dropped; **Tier B has zero history**, so C1-A and C2-C cannot be backtested at all (specs/09 §13); and nothing has been backtested, so every signal carries `validated: false`. `swing_atr_multiple` is no longer among them — it was calibrated structurally at 0.75 (F-038) and the registry has **zero `unset` parameters**. |
-| **Quality gates** | **732 tests passing** · `ruff` clean · `mypy` clean across 133 source files |
+| **Quality gates** | **737 tests passing** · `ruff` clean · `mypy` clean across 133 source files |
 
 ---
 
@@ -1064,6 +1064,10 @@ against a fresh holdout; API-change drill.
 | **D-38** | A log file the process cannot write **degrades** it; it does not kill it | The first deployment died for this exact reason and crash-looped for hours (F-042). The console handler was working and journald had every line, so the process refused to run because it could not *write about* running. A failure to log is not a failure to work. It is announced at WARNING on every start, naming the path, `journalctl`, and the `chown` that restores the files — loud, but not fatal |
 | **D-39** | The bootstrap's post-run check re-plans at the **same** `now_ms` the run used | Re-planning at the current clock moves the goalposts: a run lasting a minute ends with its window a minute longer, so the bar that closed *during* the run counts as missing. The first deployment reported "3 bars missing" on a complete run, and since the exit code follows that comparison, the command reported failure permanently. The honest question is "did I fetch what I set out to fetch" |
 | **D-40** | Diagnosis on a host is a **script that walks the chain**, not a better error message | F-042's classification was correct at every layer and nobody read it, because the only message reaching the operator — "the engine did not answer" — was four layers downstream of a crash loop. `diagnose.sh` tests ownership, the token, each service *with its restart count* (a crash loop reads as `active` without it), the local API both ways, the tunnel's registration, data, disk and errors, in that order, so the first `FAIL` is the thing to fix |
+| **D-41** | `--serve` runs uvicorn on a **worker thread** and keeps the evaluation loop on the main thread | The first version evaluated once and then blocked in `uvicorn.run()` forever, so a 72-hour run would have served one frozen evaluation (F-043). The thread *direction* matters: the writable sqlite connection is opened on the main thread and may only be used there, so evaluating on a worker would hit the cross-thread error `store/reader.py` exists to prevent |
+| **D-42** | The API reports **its own** read connection's health, never the writer's | `AppRunner.health(include_store=False)` for request threads. A sync FastAPI handler runs in a worker, so querying the writer's connection raised a cross-thread error and the dashboard showed the store `DOWN` while the engine wrote fine (F-043). It is also the better number: the writer being healthy says nothing about whether a request can read |
+| **D-43** | The Cloudflare tunnel is removed; the API is exposed directly behind its token | The owner could not get it working, and **an unmaintainable security control is not a security control**. The existing bind guard already made this safe — the app refuses to start on a non-loopback address without a token — so no new mechanism was needed. The cost is TLS: the token crosses the internet in clear. Acceptable here because the API reads only the local database, makes **no outbound calls**, holds no credential and cannot trade; the worst case of a stolen token is someone reading public prices (F-044). `HOSTING.md` documents the HTTPS upgrade for when that trade stops being acceptable |
+| **D-44** | Refused requests are counted and logged **in aggregate**, never one line each | Opening a port without noticing who knocks is careless; one line per refusal lets a scanner fill the disk, which is a denial of service handed over free. A summary every 50 also makes the distinction visible that matters — background scanning is a handful from many addresses, token-guessing is a rising count from one |
 | **D-16** | Every ruff ignore carries an inline reason | The ignores are deliberate patterns (long-lived recorder handles, pairwise `zip`, `Kind(str, Enum)`), not unfixed warnings. An unexplained ignore is indistinguishable from neglect |
 
 ---
@@ -1231,6 +1235,19 @@ per D-15 and un-ignored as later phases touch them.
 | `HOSTING.md` | The `--profile full` command carries its `sudo -u crypto` prefix; the ownership rule is stated explicitly; the Vercel redeploy requirement is in the step, not only in troubleshooting |
 | `tests/` | Four tests: logging degrades and still announces itself, a writable directory still gets its file handler, the bootstrap's window does not move, and the CLI exits 0 on a complete run under an advancing clock |
 | `docs/findings.md` | **F-042** — the deployment, the four defects, and what the diagnosis layer got wrong |
+
+### Direct exposure and the serve-loop fix (2026-10-10)
+
+| Path | Change |
+|---|---|
+| `src/app/__main__.py` | `_serve()` — uvicorn on a worker thread, the evaluation loop on the main thread, failures survived, clean shutdown (D-41). A thread-safe `api_health` source (D-42) |
+| `src/app/runner.py` | `health(include_store=False)` for request threads (D-42) |
+| `src/api/app.py` | Aggregate logging of refused requests (D-44) |
+| `deploy/azure/` | `crypto-tunnel.service`, `tunnel-env.example` and `health-check.sh` **deleted**; `env.example` and `nsg-rules.md` rewritten for a direct bind; `diagnose.sh` section 5 now asks the kernel what is listening |
+| `HOSTING.md` | Step 7 is the firewall rule rather than the tunnel; Vercel's base URL is `http://<ip>:8000`; a DuckDNS + Caddy HTTPS appendix |
+| `BUG_SOLVE.md` | Rewritten for round 2: the switchover, what the exposure costs, and the daily checks |
+| `tests/` | Five tests: a public bind without a token refuses to start, refusals are counted and summarised, `health` can omit the writer's store, the serve loop keeps evaluating, and it survives both a classified and an unclassified failure |
+| `docs/findings.md` | **F-043** (the frozen serve loop and the health thread bug), **F-044** (removing the tunnel, and what the exposure does and does not risk) |
 
 ## Next Action
 

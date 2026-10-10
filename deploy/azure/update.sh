@@ -66,7 +66,6 @@ $AS_SERVICE ./.venv/bin/python -m app --check
 echo "==> restarting"
 systemctl restart crypto-ingest
 systemctl restart crypto-app
-systemctl restart crypto-tunnel 2>/dev/null || true
 sleep 5
 systemctl is-active crypto-ingest crypto-app
 

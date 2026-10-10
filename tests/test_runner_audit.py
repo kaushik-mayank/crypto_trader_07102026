@@ -5,6 +5,7 @@ and a snapshot failure must stop the pass rather than publish signals from a mar
 Those are opposite behaviours and both are deliberate.
 """
 import json
+import time
 
 import numpy as np
 import pytest
@@ -12,7 +13,9 @@ import pytest
 from app.runner import AppRunner, load_classifiers
 from audit.trail import AuditTrail
 from config.parameters import load_registry
+from config.settings import Settings
 from core.errors import ConfigError, StartupError, StoreError
+from core.health import ComponentHealth, HealthReport
 from features.engine import FeatureEngine
 from normalize.canonical import Bar, Product, Timeframe
 from regime.classifier import RegimeClassifier
@@ -322,3 +325,140 @@ def test_binding_conditions_answer_which_condition_blocks_most_often(store):
     assert binding
     assert binding[0]["n"] >= 2
     assert {b["strategy_id"] for b in binding} <= {"C1-B", "C1-A"}
+
+
+# ---- serving and evaluating must happen together (F-043) ------------------------------------
+
+def test_serve_keeps_evaluating_rather_than_serving_one_frozen_moment(monkeypatch):
+    """The bug that would have wasted the entire 72-hour observation run.
+
+    ``--serve`` called ``uvicorn.run()`` after a single evaluation, and ``uvicorn.run()`` blocks
+    forever — so the system produced one set of suggestions at startup and then served that same
+    evaluation for as long as it ran. The only thing on the dashboard that would have moved is the
+    age counter.
+
+    Asserted by counting evaluations with a stub server, because the property is "it keeps going",
+    which no amount of reading the code proves.
+    """
+    import threading
+
+    import app.__main__ as cli
+
+    calls: list[int] = []
+    stop_after = 4
+
+    class StubServer:
+        """Stands in for uvicorn: alive, never exits, records nothing."""
+
+        def __init__(self, config):
+            self.config = config
+            self.should_exit = False
+
+        def run(self):
+            while not self.should_exit:
+                time.sleep(0.01)
+
+    monkeypatch.setattr(cli.ReadOnlyStore, "__init__", lambda self, *a, **kw: None)
+    monkeypatch.setattr(cli.ReadOnlyStore, "health", lambda self: ComponentHealth.healthy("store:read"))
+    monkeypatch.setattr(cli, "build_services", lambda *a, **kw: (None, None, None))
+    monkeypatch.setattr(cli, "create_app", lambda **kw: object())
+
+    import uvicorn
+
+    monkeypatch.setattr(uvicorn, "Config", lambda *a, **kw: object())
+    monkeypatch.setattr(uvicorn, "Server", StubServer)
+
+    stopper = threading.Event()
+
+    def evaluate_once():
+        calls.append(len(calls))
+        if len(calls) >= stop_after:
+            stopper.set()
+        return None
+
+    class StubRunner:
+        evaluations = 0
+        classifiers: dict = {}
+
+        def health(self, *, include_store: bool = True):
+            return HealthReport(components=[])
+
+    # Stop the loop from inside, by having the Event the loop waits on already set.
+    original_wait = threading.Event.wait
+
+    def wait(self, timeout=None):
+        if stopper.is_set():
+            self.set()
+        return original_wait(self, 0.01)
+
+    monkeypatch.setattr(threading.Event, "wait", wait)
+
+    settings = Settings(server={"host": "127.0.0.1", "port": 8999, "auth_token": "t" * 40})
+    rc = cli._serve(StubRunner(), settings, evaluate_once, interval_s=0.01)
+
+    assert rc == 0
+    assert len(calls) >= stop_after, (
+        f"the loop evaluated {len(calls)} time(s); serving must not freeze after the first"
+    )
+
+
+def test_a_failed_evaluation_does_not_end_the_serving_loop(monkeypatch):
+    """A transient data problem must not become an outage, because an outage is the thing nobody is
+    watching for. The runner records the failure and health reports it; the loop carries on."""
+    import threading
+
+    import app.__main__ as cli
+    from core.errors import SetupNotReady
+
+    attempts: list[int] = []
+
+    class StubServer:
+        def __init__(self, config):
+            self.should_exit = False
+
+        def run(self):
+            while not self.should_exit:
+                time.sleep(0.01)
+
+    monkeypatch.setattr(cli.ReadOnlyStore, "__init__", lambda self, *a, **kw: None)
+    monkeypatch.setattr(cli.ReadOnlyStore, "health", lambda self: ComponentHealth.healthy("store:read"))
+    monkeypatch.setattr(cli, "build_services", lambda *a, **kw: (None, None, None))
+    monkeypatch.setattr(cli, "create_app", lambda **kw: object())
+
+    import uvicorn
+
+    monkeypatch.setattr(uvicorn, "Config", lambda *a, **kw: object())
+    monkeypatch.setattr(uvicorn, "Server", StubServer)
+
+    stopper = threading.Event()
+
+    def evaluate_once():
+        attempts.append(len(attempts))
+        if len(attempts) == 1:
+            raise SetupNotReady("no 15m bars yet", component="t", operation="t")
+        if len(attempts) == 2:
+            raise RuntimeError("something unclassified")
+        stopper.set()
+        return None
+
+    class StubRunner:
+        evaluations = 0
+        classifiers: dict = {}
+
+        def health(self, *, include_store: bool = True):
+            return HealthReport(components=[])
+
+    original_wait = threading.Event.wait
+
+    def wait(self, timeout=None):
+        if stopper.is_set():
+            self.set()
+        return original_wait(self, 0.01)
+
+    monkeypatch.setattr(threading.Event, "wait", wait)
+
+    settings = Settings(server={"host": "127.0.0.1", "port": 8998, "auth_token": "t" * 40})
+    assert cli._serve(StubRunner(), settings, evaluate_once, interval_s=0.01) == 0
+    assert len(attempts) >= 3, (
+        "a classified failure and an unclassified crash must both be survived, not fatal"
+    )

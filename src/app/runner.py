@@ -364,11 +364,27 @@ class AppRunner:
 
     # ---- health --------------------------------------------------------------------------
 
-    def health(self) -> HealthReport:
+    def health(self, *, include_store: bool = True) -> HealthReport:
         """One report, classified so the operator knows *where* to look (the whole point of
-        :class:`core.errors.ProblemClass`)."""
+        :class:`core.errors.ProblemClass`).
+
+        ``include_store=False`` omits the writer's own store check, and the API **must** pass that.
+
+        The reason is a thread, not a preference. The writer's ``sqlite3`` connection belongs to the
+        thread that opened it, and a sync FastAPI handler runs in a worker thread — so querying it
+        from a request raises *"SQLite objects created in a thread can only be used in that same
+        thread"*. The symptom was a dashboard reporting the store as ``DOWN`` with a confusing
+        message while the engine was writing perfectly well (F-043), which is the precise shape of
+        failure :mod:`store.reader` was written to prevent and which this call reintroduced one
+        level up.
+
+        Omitting it loses nothing: the API reports ``store:read`` from
+        :meth:`store.reader.ReadOnlyStore.health`, which checks **the connection the API actually
+        uses**. That is the more honest reading anyway — the writer's connection being healthy says
+        nothing about whether a request can read.
+        """
         components: list[ComponentHealth] = []
-        store_health = getattr(self.builder.store, "health", None)
+        store_health = getattr(self.builder.store, "health", None) if include_store else None
         if callable(store_health):
             components.append(store_health())
         for asset, classifier in self.classifiers.items():

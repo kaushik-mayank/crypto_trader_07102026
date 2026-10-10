@@ -479,3 +479,82 @@ def test_the_token_is_compared_in_constant_time():
         encoding="utf-8")
     assert "secrets.compare_digest" in source
     assert "supplied != auth_token" not in source
+
+
+# ---- a directly-exposed port (F-043: no tunnel) --------------------------------------------
+
+def test_a_public_bind_without_a_token_refuses_to_start():
+    """The whole safety model of the direct-exposure deployment, in one guard.
+
+    With the Cloudflare tunnel removed, the port is reachable from the internet and the token is the
+    only thing in front of it. So there must be no configuration in which the port is open and
+    unauthenticated — and this is a startup failure rather than a warning, because a warning is
+    something a host carries on past.
+    """
+    with pytest.raises(StartupError, match="refusing to bind"):
+        assert_bind_allowed("0.0.0.0", "")
+    assert_bind_allowed("0.0.0.0", "a-long-random-token")       # does not raise
+
+
+def test_refused_requests_are_counted_and_logged_in_aggregate(tmp_path):
+    """One log line per refusal would let a scanner fill the disk — a denial of service handed over
+    for free. Once the port is public, refusals arrive as background noise, so they are summarised.
+    """
+    from api.app import REFUSAL_LOG_EVERY
+
+    store = open_store(tmp_path / "api.db")
+    try:
+        signals, market, health = build_services(store)
+        app = create_app(signals=signals, market=market, health=health,
+                         auth_token="the-real-token")
+        from fastapi.testclient import TestClient
+
+        with TestClient(app) as client:
+            # Well under the threshold: counted, not yet logged.
+            for _ in range(3):
+                assert client.get("/api/health").status_code == 401
+            assert app.state.refusals["count"] == 3
+            assert app.state.refusals["next_log_at"] == REFUSAL_LOG_EVERY
+
+            # Past the threshold: the summary fires once and the next one is scheduled further out,
+            # so the log rate stays flat however hard the port is probed.
+            for _ in range(REFUSAL_LOG_EVERY):
+                client.get("/api/health")
+            assert app.state.refusals["count"] == 3 + REFUSAL_LOG_EVERY
+            assert app.state.refusals["next_log_at"] > REFUSAL_LOG_EVERY
+
+        # A valid token is unaffected by any of it. The status is incidental here — these services
+        # were built without a health source, so /api/health answers 503 by design — what matters is
+        # that the request got past the guard and was not counted.
+        with TestClient(app) as client:
+            before = app.state.refusals["count"]
+            response = client.get("/api/health", headers={"x-auth-token": "the-real-token"})
+            assert response.status_code != 401, "a valid token must get past the guard"
+            assert app.state.refusals["count"] == before, "a valid request is not a refusal"
+    finally:
+        store.close()
+
+
+def test_the_runner_health_can_omit_the_writers_store_for_a_request_thread():
+    """F-043's second half: a sync FastAPI handler runs in a worker thread, and the writer's sqlite
+    connection belongs to the thread that opened it.
+
+    Querying it from a request raised *"SQLite objects created in a thread can only be used in that
+    same thread"*, so the dashboard reported the store as DOWN while the engine was writing happily.
+    The API passes ``include_store=False`` and the reader reports its own connection instead — which
+    is the more honest number, because the writer being healthy says nothing about whether a request
+    can read.
+    """
+    import inspect
+
+    from app.runner import AppRunner
+
+    signature = inspect.signature(AppRunner.health)
+    assert "include_store" in signature.parameters
+    assert signature.parameters["include_store"].default is True, \
+        "the default must stay True so the engine's own health is unchanged"
+
+    source = inspect.getsource(AppRunner.health)
+    assert "include_store" in source
+    # The store check must be gated on the flag, not merely accept it.
+    assert "if include_store else None" in source
