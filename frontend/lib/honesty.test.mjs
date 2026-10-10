@@ -65,6 +65,11 @@ test('age reads as elapsed time, never a wall-clock stamp', () => {
 function panelState(payload) {
   if (!payload || typeof payload !== 'object') return { kind: 'down' };
   if (payload.error) return { kind: 'down' };
+  // Every engine response carries a freshness envelope. A JSON object without one did not come from
+  // the engine (F-050).
+  if (payload.envelope === undefined && payload.system_status === undefined) {
+    return { kind: 'down' };
+  }
   const status = String(payload.envelope?.system_status ?? payload.system_status ?? '').toUpperCase();
   if (status === 'DOWN') return { kind: 'down' };
   if (status === 'WARMING') return { kind: 'warming' };
@@ -80,8 +85,18 @@ test('an engine error is DOWN, not an empty market', () => {
   assert.equal(panelState('not an object').kind, 'down');
 });
 
+test('a reply with no envelope is DOWN, however calm it looks', () => {
+  // The exact body a misconfigured CT_API_BASE produces: FastAPI's 404. It parses, it has no
+  // `error` key and no status, and the old code therefore called it `ready` — then reported an
+  // unknown age and an empty market for an engine it had never reached (F-050).
+  assert.equal(panelState({ detail: 'Not Found' }).kind, 'down');
+  assert.equal(panelState({}).kind, 'down');
+  // And a real engine response is unaffected, envelope present and empty though it is.
+  assert.equal(panelState({ envelope: {}, data: { signals: [] } }).kind, 'ready');
+});
+
 test('a quiet market is ready-with-no-data, which is a different state', () => {
-  const quiet = panelState({ envelope: { system_status: 'HEALTHY' }, data: [] });
+  const quiet = panelState({ envelope: { system_status: 'HEALTHY' }, data: { signals: [] } });
   assert.equal(quiet.kind, 'ready');
 });
 

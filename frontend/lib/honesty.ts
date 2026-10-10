@@ -88,6 +88,31 @@ export function panelState(payload: unknown): PanelState {
     };
   }
 
+  // **Every** engine response carries a freshness envelope (`specs/14` §3). A JSON object without
+  // one did not come from the engine, and must not be treated as one.
+  //
+  // This is the hole that produced the first deployment's most misleading screen. `CT_API_BASE` set
+  // to `http://IP:8000/api` makes the proxy request `/api/api/signals/live`, which FastAPI answers
+  // `404 {"detail": "Not Found"}`. That body has no `error` key and no `system_status`, so this
+  // function returned `ready`; the age was unknown because there was no envelope; the signal list
+  // was absent so it defaulted to empty. The dashboard then reported, in perfectly calm language,
+  // "market data age unknown" and "No suggestions right now" — for an engine it was never talking
+  // to (F-050).
+  //
+  // A missing envelope is therefore `down`, and the message says what it actually means.
+  if (p.envelope === undefined && p.system_status === undefined) {
+    return {
+      kind: 'down',
+      message: 'the reply did not come from the engine',
+      likelyCause:
+        'something answered, but without the freshness envelope every engine response carries — ' +
+        'most often CT_API_BASE pointing at the wrong path, so the engine returns 404 Not Found',
+      remediation:
+        'CT_API_BASE must be the host and port only, with no path: http://YOUR_VM_IP:8000 — not ' +
+        '.../api. Fix it in Vercel -> Project -> Settings -> Environment Variables and redeploy.',
+    };
+  }
+
   const status = String(p.envelope?.system_status ?? p.system_status ?? '').toUpperCase();
   if (status === 'DOWN') {
     return { kind: 'down', message: p.envelope?.detail ?? 'the engine reports itself DOWN' };

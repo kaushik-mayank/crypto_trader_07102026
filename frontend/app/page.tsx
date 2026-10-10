@@ -42,7 +42,15 @@ export default function Page() {
     : panelState(sig?.payload);
 
   const envelope = (sig?.payload as any)?.envelope ?? {};
-  const data: any[] = (sig?.payload as any)?.data ?? [];
+  // `data` is an object, and the signals are the `signals` key inside it (`services.py:live`).
+  // Reading `data` itself bound that object to an `any[]`, so `data.length` was `undefined`,
+  // `data.length === 0` was false, and the page fell through to `data.map(...)` on something with
+  // no `.map` — a TypeError during render. **No suggestion could ever have appeared on this page**,
+  // whatever the engine found. The annotation is what hid it: `any[]` asserts a shape instead of
+  // checking one, so there was nothing for the compiler to object to. Guarded now, and
+  // `tests/test_frontend_contract.py` asserts the accessor by name (F-048).
+  const payloadData = (sig?.payload as any)?.data;
+  const data: any[] = Array.isArray(payloadData?.signals) ? payloadData.signals : [];
 
   return (
     <main className="wrap">
@@ -100,19 +108,11 @@ export default function Page() {
       )}
 
       <h2>System health</h2>
-      {state.health?.transportError || (state.health?.payload as any)?.error ? (
-        <Down
-          state={{
-            kind: 'down',
-            message:
-              state.health?.transportError ??
-              (state.health?.payload as any)?.error?.message ??
-              'health could not be read',
-          }}
-        />
-      ) : (
-        <HealthPanel payload={(state.health?.payload as any)?.data ?? state.health?.payload} />
-      )}
+      {/* "The engine did not report any component health" was being shown for an unreachable
+          engine as well as for an engine that answered with nothing — the first deployment hit
+          exactly that. The health reading is now classified before it is rendered, so an
+          unreachable engine reads as unreachable (F-047). */}
+      <HealthSection result={state.health} />
 
       <footer>
         Refreshes every {REFRESH_MS / 1000}s. Suggestions are produced by twelve strategies across
@@ -121,4 +121,61 @@ export default function Page() {
       </footer>
     </main>
   );
+}
+
+/**
+ * The health reading, classified before it is rendered.
+ *
+ * Four outcomes, and they must not share a message:
+ *
+ * 1. the request never arrived — infrastructure, and nothing else on the page is trustworthy;
+ * 2. the engine answered with an error — show the engine's own words, cause and fix;
+ * 3. the engine answered with a non-OK status and no error body — something between the browser
+ *    and the engine replied, so name the status code rather than inventing a cause;
+ * 4. the engine answered — hand it to `HealthPanel`.
+ */
+function HealthSection({ result }: { result: ApiResult | null }) {
+  if (result === null) {
+    return <div className="card empty">Reading health…</div>;
+  }
+  const payload = result.payload as Record<string, any> | null;
+
+  if (result.transportError) {
+    return (
+      <Down
+        state={{
+          kind: 'down',
+          message: result.transportError,
+          likelyCause: 'the VM is off, port 8000 is closed in the Azure firewall, or CT_API_BASE / CT_API_TOKEN on Vercel do not match the VM',
+          remediation: 'on the VM, run: bash /opt/crypto-trader/deploy/azure/diagnose.sh',
+        }}
+      />
+    );
+  }
+  if (payload?.error) {
+    return (
+      <Down
+        state={{
+          kind: 'down',
+          message: String(payload.error.message ?? 'health could not be read'),
+          likelyCause: payload.error.likely_cause ?? undefined,
+          remediation: payload.error.remediation ?? undefined,
+          correlationId: payload.error.correlation_id ?? undefined,
+        }}
+      />
+    );
+  }
+  if (!result.ok) {
+    return (
+      <Down
+        state={{
+          kind: 'down',
+          message: `the engine answered HTTP ${result.status} with no explanation`,
+          likelyCause: 'the reply came from something in front of the engine rather than from the engine itself',
+          remediation: 'on the VM, run: bash /opt/crypto-trader/deploy/azure/diagnose.sh',
+        }}
+      />
+    );
+  }
+  return <HealthPanel payload={payload?.data ?? payload} />;
 }

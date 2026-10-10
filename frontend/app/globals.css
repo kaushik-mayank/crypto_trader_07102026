@@ -87,3 +87,102 @@ h2 { font-size: 14px; margin: 24px 0 8px; color: var(--muted); font-weight: 600;
 footer { color: var(--muted); font-size: 12px; margin-top: 32px; }
 
 @media (max-width: 640px) { .row { gap: 10px; } }
+
+/* ---- shell and navigation ------------------------------------------------------------- */
+
+.shell { display: flex; min-height: 100vh; align-items: stretch; }
+
+.content { flex: 1; min-width: 0; }   /* min-width:0 so a wide chart cannot push the nav off */
+
+.nav {
+  width: 210px;
+  flex: 0 0 210px;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+  padding: 20px 0 16px;
+  display: flex;
+  flex-direction: column;
+}
+
+.nav-brand {
+  padding: 0 16px 16px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.nav-brand-sub {
+  display: block;
+  color: var(--muted);
+  font-weight: 400;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-top: 2px;
+}
+
+.nav ul { list-style: none; margin: 0; padding: 0; }
+
+.nav-link {
+  display: block;
+  padding: 10px 16px;
+  color: var(--text);
+  text-decoration: none;
+  /* A left border rather than a background fill: the active page is marked by position and weight
+     as well as colour, because colour alone is already carrying direction and health elsewhere. */
+  border-left: 3px solid transparent;
+}
+.nav-link:hover { background: rgba(255, 255, 255, 0.03); }
+.nav-link.active { border-left-color: var(--act); font-weight: 600; }
+
+.nav-hint {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 400;
+  margin-top: 1px;
+}
+
+.nav-foot {
+  margin: auto 16px 0;
+  padding-top: 16px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+  border-top: 1px solid var(--border);
+}
+
+/* ---- controls ------------------------------------------------------------------------- */
+
+.controls { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-end; }
+
+.control { display: flex; flex-direction: column; gap: 4px; }
+
+.seg { display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+
+.seg button {
+  background: transparent;
+  border: 0;
+  border-right: 1px solid var(--border);
+  color: var(--muted);
+  padding: 6px 11px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.seg button:last-child { border-right: 0; }
+.seg button:hover { background: rgba(255, 255, 255, 0.04); color: var(--text); }
+.seg button[aria-pressed='true'] {
+  background: rgba(210, 153, 34, 0.14);
+  color: var(--act);
+  font-weight: 600;
+}
+
+/* On a phone the nav goes on top and the chart gets the full width. */
+@media (max-width: 720px) {
+  .shell { flex-direction: column; }
+  .nav { width: auto; flex: none; border-right: 0; border-bottom: 1px solid var(--border);
+         padding-bottom: 8px; }
+  .nav ul { display: flex; }
+  .nav-link { border-left: 0; border-bottom: 3px solid transparent; }
+  .nav-link.active { border-left-color: transparent; border-bottom-color: var(--act); }
+  .nav-foot { margin-top: 12px; }
+}

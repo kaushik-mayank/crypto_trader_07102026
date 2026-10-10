@@ -1,14 +1,27 @@
 # Dashboard (Vercel)
 
-The read-only dashboard for the suggestion engine. Deployed on Vercel; the engine itself runs on an
-Azure VM and is never exposed to the internet.
+The read-only dashboard for the suggestion engine. Deployed on Vercel; the engine runs on an Azure VM
+and answers on port 8000 behind a shared token.
 
 Full setup: [`../HOSTING.md`](../HOSTING.md).
+
+## Pages
+
+| Page | File | What it is for |
+|---|---|---|
+| Suggestions | [`app/page.tsx`](app/page.tsx) | What the strategies currently say |
+| Chart | [`app/chart/page.tsx`](app/chart/page.tsx) | **The prices behind it** |
+
+The pairing is the point. Every panel on the suggestions page reports a *conclusion* — no
+suggestions, a regime cell, a health status — and every one of them looks identical whether the
+prices behind it are current, stale or absent. The chart is the one view where wrong data is obvious
+at a glance, which is why it shows the newest bar's age in intervals, how many bars are stored versus
+drawn, and how many have not yet been confirmed by a second fetch.
 
 ## How it reaches the engine
 
 ```
-browser → this app's /api/proxy/... route (on Vercel's server) → Cloudflare tunnel → Azure VM
+browser → this app's /api/proxy/... route (on Vercel's server) → Azure VM, port 8000
 ```
 
 The browser never talks to the engine. Every call goes through
@@ -18,11 +31,20 @@ server and adds the shared token there. Three consequences, all deliberate:
 - the token **never reaches the browser**, which is why neither environment variable is named
   `NEXT_PUBLIC_*` — that prefix compiles a value into the JavaScript the browser downloads;
 - the engine needs no CORS configuration, because no browser ever calls it;
-- the engine can stay bound to `127.0.0.1`, so the Azure firewall keeps every inbound port closed.
+- only this one route knows the engine's address, so moving the engine is a one-variable change.
+
+`CT_API_BASE` is the **host and port only** — `http://<ip>:8000`, never with `/api` on the end. A
+path there makes every request a doubled one, which the engine answers `404 {"detail": "Not Found"}`;
+that used to render as a calm, empty market, and both this route and `lib/honesty.ts` now refuse it
+explicitly (F-050).
 
 The proxy forwards **GET only**, and only paths on an explicit allow-list. The engine is read-only by
 construction — there is no order-placing code anywhere in the project — but the proxy does not rely
 on that, so a future endpoint cannot become publicly reachable by accident.
+
+The tunnel that used to sit in the middle is gone (F-044): an unmaintainable security control is not
+a security control, and the engine's own bind guard already refuses to start on a public address
+without a token. The cost is TLS — see `../HOSTING.md`'s HTTPS appendix for closing that.
 
 ## Running it locally
 

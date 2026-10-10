@@ -176,9 +176,48 @@ export function ExposureStrip({ signals }: { signals: Signal[] }) {
  * tunnel", and a dashboard that renders every failure the same way throws it away.
  */
 export function HealthPanel({ payload }: { payload: any }) {
-  const components: any[] = payload?.components ?? payload?.data?.components ?? [];
+  // Three different nothings, and they had all been collapsed into one sentence — "the engine did
+  // not report any component health" — which the first deployment showed for an engine that could
+  // not be reached at all. Each now says which nothing it is.
+  if (payload === null || payload === undefined) {
+    return (
+      <div className="card down">
+        <h3>Cannot tell — no health reading arrived</h3>
+        <p style={{ margin: 0 }}>
+          The dashboard has no health payload at all, which is not the same as the engine reporting
+          itself unhealthy. Nothing on this page is known to be current.
+        </p>
+      </div>
+    );
+  }
+  if (!Array.isArray(payload.components)) {
+    return (
+      <div className="card down">
+        <h3>Cannot tell — the health reply was not the expected shape</h3>
+        <p style={{ margin: '0 0 8px' }}>
+          Something answered, but without a component list. That is an application or version
+          problem, not a market one.
+        </p>
+        <p style={{ margin: 0 }}>
+          <span className="label">what to do</span>
+          the VM and this deployment are probably on different versions — redeploy both from the
+          same commit
+        </p>
+      </div>
+    );
+  }
+  const components: any[] = payload.components;
   if (!components.length) {
-    return <div className="card empty">The engine did not report any component health.</div>;
+    return (
+      <div className="card empty">
+        <strong style={{ color: 'var(--text)' }}>The engine reported an empty health list</strong>
+        <p style={{ margin: '6px 0 0' }}>
+          It answered, and said it is monitoring nothing. The engine always registers at least a
+          store check and a runner check, so an empty list means it was built without its health
+          source attached — an application bug rather than anything wrong with the market.
+        </p>
+      </div>
+    );
   }
   const bad = components.filter((c) => String(c.status).toUpperCase() !== 'HEALTHY');
   return (

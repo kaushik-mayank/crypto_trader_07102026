@@ -27,6 +27,21 @@ async function get<T>(path: string, search?: Record<string, string>): Promise<Ap
   try {
     const res = await fetch(`/api/proxy/${path}${qs}`, { cache: 'no-store' });
     const payload = (await res.json().catch(() => null)) as T | null;
+    if (payload === null) {
+      // The response arrived but was not JSON — a gateway error page, a truncated body, a proxy
+      // that answered before reaching the engine. Reported as a transport failure rather than as
+      // `payload: null`, because a null payload reads downstream as "the engine said nothing",
+      // which is indistinguishable from a calm market and is the one conflation specs/14 §10
+      // forbids outright.
+      return {
+        ok: false,
+        status: res.status,
+        payload: null,
+        transportError:
+          `the engine's answer could not be read as JSON (HTTP ${res.status})` +
+          ' — something between this page and the engine replied instead of the engine',
+      };
+    }
     return { ok: res.ok, status: res.status, payload };
   } catch (e) {
     // The page is open and the network is gone. Reported as its own state rather than as an empty
@@ -46,6 +61,15 @@ export const api = {
   regime: () => get('api/regime'),
   warmup: () => get('api/warmup'),
   rejections: (asset: string) => get(`api/assets/${encodeURIComponent(asset)}/rejections`),
+  /**
+   * Stored OHLCV for the chart.
+   *
+   * `timeframe` and `limit` are validated and clamped by the engine, not here — the frontend
+   * offering a fixed set of buttons is a convenience, not a guarantee, and the engine must not
+   * depend on it.
+   */
+  candles: (asset: string, timeframe: string, limit: number) =>
+    get(`api/candles/${encodeURIComponent(asset)}`, { timeframe, limit: String(limit) }),
 };
 
 /**
