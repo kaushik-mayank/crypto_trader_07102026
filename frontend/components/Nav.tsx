@@ -15,6 +15,7 @@ const PAGES = [
   { href: '/', label: 'Suggestions', hint: 'what the strategies currently say' },
   { href: '/chart', label: 'Chart', hint: 'the prices behind it' },
   { href: '/data', label: 'Data', hint: 'is every source still arriving?' },
+  { href: '/analytics', label: 'Analytics', hint: 'what has been suggested, and how it ended' },
 ];
 
 export function Nav() {

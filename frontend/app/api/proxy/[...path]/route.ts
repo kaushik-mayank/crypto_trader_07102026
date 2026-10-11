@@ -38,11 +38,13 @@ const PROXY_TIMEOUT_MS = 20_000;
 const ALLOWED = new Set([
   'api/signals/live',
   'api/signals/history',
+  'api/signals/days',
   'api/health',
   'api/regime',
   'api/warmup',
   'api/events',
   'api/sources',
+  'api/analytics',
 ]);
 
 /** Paths whose last segment is a variable id, matched by shape. */

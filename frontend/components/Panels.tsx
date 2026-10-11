@@ -364,6 +364,17 @@ export function HealthPanel({ payload }: { payload: any }) {
     );
   }
   const components: any[] = payload.components;
+  // A model finding is not a fault, and counting it as one made the dashboard permanently report
+  // "2 not healthy" for an expected operating mode. `ProblemClass.MODELLING` exists precisely to
+  // draw this line — "the triage answer is *read the finding*, not *check the feed* or *fix the
+  // code*" — and both dashboards were discarding it one layer above where it was declared.
+  //
+  // The cost was not the wrong label. It was that a **real** DEGRADED became invisible among two
+  // that are always there, which is the one thing a health panel exists to prevent (F-060).
+  const modelling: any[] = components.filter(
+    (c) => String(c.problem_class) === 'modelling',
+  );
+  const operational = components.filter((c) => String(c.problem_class) !== 'modelling');
   if (!components.length) {
     return (
       <div className="card empty">
@@ -376,24 +387,67 @@ export function HealthPanel({ payload }: { payload: any }) {
       </div>
     );
   }
-  const bad = components.filter((c) => String(c.status).toUpperCase() !== 'HEALTHY');
+  const faults = operational.filter((c) => String(c.status).toUpperCase() !== 'HEALTHY');
   return (
-    <div className="card">
-      <div className="row">
-        <strong>{components.length - bad.length} healthy</strong>
-        {bad.length > 0 && <strong className="short">{bad.length} not healthy</strong>}
-      </div>
-      {bad.map((c) => (
-        <div key={c.name} style={{ marginTop: 10 }}>
-          <div className="row">
-            <span className="mono">{c.name}</span>
-            <span className="short">{c.status}</span>
-            {c.problem_class && <span className="age age-amber">{c.problem_class}</span>}
-          </div>
-          {c.detail && <p style={{ margin: '4px 0 0', color: 'var(--muted)' }}>{c.detail}</p>}
-          {c.remediation && <p style={{ margin: '4px 0 0' }}>{c.remediation}</p>}
+    <>
+      <div className="card">
+        <div className="row">
+          <strong>{operational.length - faults.length} healthy</strong>
+          {faults.length > 0 ? (
+            <strong className="short">{faults.length} not healthy</strong>
+          ) : (
+            <span className="age age-ok">no faults</span>
+          )}
         </div>
-      ))}
-    </div>
+        {faults.map((c) => (
+          <div key={c.name} style={{ marginTop: 10 }}>
+            <div className="row">
+              <span className="mono">{c.name}</span>
+              <span className="short">{c.status}</span>
+              {c.problem_class && <span className="age age-amber">{c.problem_class}</span>}
+            </div>
+            {c.detail && <p style={{ margin: '4px 0 0', color: 'var(--muted)' }}>{c.detail}</p>}
+            {c.remediation && <p style={{ margin: '4px 0 0' }}>{c.remediation}</p>}
+          </div>
+        ))}
+      </div>
+
+      {/* Its own panel, and still prominent. specs/12 §10: "the degradation is surfaced in the
+          dashboard status panel. A user should be able to see the system is running with a weaker
+          filter set." Visible, named per asset, and explicitly not counted as a fault. */}
+      {modelling.length > 0 && (
+        <div className="card model-finding">
+          <div className="row">
+            <strong>Running with reduced selectivity</strong>
+            <span className="age age-unknown">{modelling.length} model finding{modelling.length === 1 ? '' : 's'}</span>
+          </div>
+          <p style={{ margin: '8px 0 0' }}>
+            This is <strong>not a fault and there is nothing to fix.</strong> The regime model failed
+            its stability test on these assets, so the system drops the regime-stability conditions
+            and keeps every raw-measurement threshold. Strategies run with a weaker filter set, which
+            means slightly more suggestions pass, not that any of them are broken.
+          </p>
+          {modelling.map((c) => (
+            <div key={c.name} style={{ marginTop: 10 }}>
+              <div className="row">
+                <span className="mono">{c.name}</span>
+                <span className="age age-unknown">{c.status}</span>
+              </div>
+              {c.detail && <p style={{ margin: '4px 0 0', color: 'var(--muted)' }}>{c.detail}</p>}
+              {Array.isArray(c.context?.failed_tests) && c.context.failed_tests.length > 0 && (
+                <p style={{ margin: '4px 0 0', color: 'var(--muted)' }}>
+                  <span className="label">failed tests</span>
+                  <span className="mono">{c.context.failed_tests.join(', ')}</span>
+                </p>
+              )}
+            </div>
+          ))}
+          <p style={{ margin: '10px 0 0', color: 'var(--muted)' }}>
+            Assets not listed here passed, and use the full condition set. The system runs
+            per-asset mixed mode by design.
+          </p>
+        </div>
+      )}
+    </>
   );
 }

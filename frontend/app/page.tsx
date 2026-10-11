@@ -11,6 +11,7 @@
 import { useCallback, useEffect, useState } from 'react';
 
 import { ActionBar, Down, Empty, ExposureStrip, Freshness, HealthPanel, SignalCard, Warming } from '@/components/Panels';
+import { DayPicker, HistoryRow, ModelFilter, StatusFilter, modelList } from '@/components/Suggestions';
 import { REFRESH_MS, api, type ApiResult } from '@/lib/api';
 import { ageText, panelState } from '@/lib/honesty';
 
@@ -22,19 +23,78 @@ type State = {
   loading: boolean;
 };
 
+/** How many historical suggestions one page fetches. Paged, never the whole table. */
+const HISTORY_PAGE = 50;
+
 export default function Page() {
   const [state, setState] = useState<State>({ signals: null, health: null, fetchedAt: null, loading: true });
+  /** `live` is the lifecycle's own definition of active; `history` browses by issue date. */
+  const [view, setView] = useState<'live' | 'history'>('live');
+  const [model, setModel] = useState('');
+  const [status, setStatus] = useState('');
+  const [day, setDay] = useState('');
+  const [days, setDays] = useState<any[]>([]);
+  const [history, setHistory] = useState<ApiResult | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
 
   const refresh = useCallback(async () => {
-    const [signals, health] = await Promise.all([api.liveSignals(), api.health()]);
+    const [signals, health] = await Promise.all([
+      api.liveSignalsFiltered(model || undefined),
+      api.health(),
+    ]);
     setState({ signals, health, fetchedAt: Date.now(), loading: false });
-  }, []);
+  }, [model]);
 
   useEffect(() => {
     void refresh();
+    // The live poll runs only while the live view is open. Polling a view nobody is looking at
+    // spends the proxy's budget and the VM's cycles to update a panel off screen.
+    if (view !== 'live') return undefined;
     const t = setInterval(() => void refresh(), REFRESH_MS);
     return () => clearInterval(t);
-  }, [refresh]);
+  }, [refresh, view]);
+
+  // The day index is fetched when the history view opens and when the model filter changes — not on
+  // a timer. Past days do not gain suggestions, so re-polling them would be requests spent to
+  // receive the same answer.
+  useEffect(() => {
+    if (view !== 'history') return;
+    let cancelled = false;
+    void (async () => {
+      const res = await api.signalDays(model || undefined);
+      const list = (res.payload as any)?.data?.days ?? [];
+      if (cancelled) return;
+      setDays(list);
+      // Default to the newest day that has anything, so the view is never empty on open.
+      setDay((current) => (current && list.some((d: any) => d.day === current)
+        ? current
+        : (list[0]?.day ?? '')));
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [view, model]);
+
+  useEffect(() => {
+    if (view !== 'history' || !day) return;
+    let cancelled = false;
+    setHistoryLoading(true);
+    void (async () => {
+      const res = await api.signalHistory({
+        day,
+        strategyClass: model || undefined,
+        state: status || undefined,
+        limit: HISTORY_PAGE,
+      });
+      if (!cancelled) {
+        setHistory(res);
+        setHistoryLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [view, day, model, status]);
 
   const sig = state.signals;
   const panel = sig?.transportError
@@ -54,6 +114,11 @@ export default function Page() {
   // Undefined rather than null when the engine does not publish it, so `Freshness` renders its own
   // "the engine did not say how old this is" rather than a confident-looking zero.
   const marketAge: number | null | undefined = payloadData?.market_data?.age_s;
+  // Labels come from the engine's own `models` map (the canonical specs/03-06 titles), with counts
+  // where the payload carried them. The frontend never derives a model from a strategy id.
+  const models = modelList(payloadData);
+  const historyData = (history?.payload as any)?.data;
+  const historySignals: any[] = Array.isArray(historyData?.signals) ? historyData.signals : [];
 
   return (
     <main className="wrap">
@@ -108,15 +173,85 @@ export default function Page() {
           <ExposureStrip signals={data} />
 
           <h2>Suggestions</h2>
-          {data.length === 0 ? (
-            <Empty
-              reason={
-                envelope.detail ??
-                'No strategy met all of its conditions on the latest closed bar.'
-              }
-            />
+
+          <div className="card">
+            <div className="controls">
+              <div className="control">
+                <span className="label">view</span>
+                <div className="seg" role="group" aria-label="View">
+                  <button type="button" aria-pressed={view === 'live'}
+                          onClick={() => setView('live')}
+                          title="setups the engine is currently tracking">
+                    Live
+                  </button>
+                  <button type="button" aria-pressed={view === 'history'}
+                          onClick={() => setView('history')}
+                          title="past suggestions, by the date they were issued">
+                    History
+                  </button>
+                </div>
+              </div>
+              <ModelFilter models={models} value={model} onChange={setModel} />
+              {view === 'history' && <StatusFilter value={status} onChange={setStatus} />}
+            </div>
+            <p style={{ margin: '10px 0 0', color: 'var(--muted)' }}>
+              <strong style={{ color: 'var(--text)' }}>Live</strong> is what the engine is tracking
+              now — a setup detected, at its trigger, or triggered and being followed.{' '}
+              <strong style={{ color: 'var(--text)' }}>History</strong> is every suggestion by the
+              date it was <em>issued</em>, which does not move when its outcome is recorded later.
+            </p>
+          </div>
+
+          {view === 'live' ? (
+            data.length === 0 ? (
+              <Empty
+                reason={
+                  model
+                    ? 'No setup from this model met all of its conditions on the latest closed bar. Other models may have.'
+                    : envelope.detail ??
+                      'No strategy met all of its conditions on the latest closed bar.'
+                }
+              />
+            ) : (
+              data.map((s) => <SignalCard key={s.signal_id} signal={s} />)
+            )
           ) : (
-            data.map((s) => <SignalCard key={s.signal_id} signal={s} />)
+            <>
+              <div className="card">
+                <DayPicker days={days} value={day} onChange={setDay} />
+              </div>
+
+              {history?.transportError && (
+                <Down state={{ kind: 'down', message: history.transportError }} />
+              )}
+              {(historyData === undefined && !historyLoading && days.length > 0) && (
+                <div className="card empty">Select a date above.</div>
+              )}
+              {historyLoading && <div className="card empty">Reading that day…</div>}
+
+              {!historyLoading && historyData && historySignals.length === 0 && (
+                <div className="card empty">
+                  <strong style={{ color: 'var(--text)' }}>
+                    Nothing matches these filters on {day}
+                  </strong>
+                  <p style={{ margin: '6px 0 0' }}>
+                    The engine answered — this is an empty result, not a failure. Widen the model or
+                    status filter, or pick another date.
+                  </p>
+                </div>
+              )}
+
+              {!historyLoading && historySignals.map((s) => (
+                <HistoryRow key={s.signal_id} signal={s} models={models} />
+              ))}
+
+              {historyData?.next_cursor && (
+                <div className="card empty">
+                  Showing the first {historySignals.length} of this day. More exist — narrow by
+                  model or status to see them.
+                </div>
+              )}
+            </>
           )}
         </>
       )}

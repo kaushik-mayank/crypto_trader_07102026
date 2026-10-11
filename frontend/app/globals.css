@@ -202,3 +202,50 @@ footer { color: var(--muted); font-size: 12px; margin-top: 32px; }
 .data-table tr:last-child td { border-bottom: 0; }
 /* Tabular figures so a column of numbers lines up and an outlier is visible by its width. */
 .data-table .mono { font-variant-numeric: tabular-nums; }
+
+/* A model finding, deliberately NOT styled like a fault. Purple is the "modelling/stale" token,
+   already distinct from down-red and degraded-amber; the heading carries the meaning in words for a
+   reader who cannot separate the hues. */
+.card.model-finding { border-left: 3px solid var(--stale); }
+.card.model-finding strong { color: var(--stale); }
+
+/* ---- model filter, date strip and history rows ------------------------------------------- */
+/* Reuses .seg, .card, .row and .label so the suggestions page keeps one visual language rather
+   than acquiring a second alongside it. */
+.chip-count { color: var(--muted); font-variant-numeric: tabular-nums; }
+.select {
+  background: var(--surface); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 10px; font: inherit; font-size: 13px;
+}
+/* Horizontally scrolling rather than wrapping: the newest days stay in the same place as the list
+   grows, so the control does not reflow under the reader every day. */
+.day-strip { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; max-width: 100%; }
+.day {
+  display: flex; flex-direction: column; gap: 2px; align-items: flex-start; white-space: nowrap;
+  background: var(--surface); color: var(--muted); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 10px; font: inherit; cursor: pointer;
+}
+.day:hover { background: rgba(255, 255, 255, 0.04); color: var(--text); }
+.day.active { border-color: var(--act); color: var(--text); }
+.day-date { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+.day-counts { font-size: 11px; }
+/* The outcome, in words as well as colour: the word is the cue that survives a monochrome print
+   and a reader who cannot separate the red/green axis. */
+.outcome { font-size: 12px; text-transform: capitalize; }
+.outcome-hit { color: var(--long); font-weight: 600; }
+.outcome-stopped { color: var(--short); font-weight: 600; }
+.outcome-open { color: var(--act); }
+.outcome-closed { color: var(--muted); }
+.history-row { padding: 12px 16px; }
+
+/* ---- analytics metrics ------------------------------------------------------------------- */
+/* A metric is a label, a value and its fraction. The fraction is not decoration: it is what makes
+   the number checkable against a direct query, and what stops `100%` from one resolved suggestion
+   reading as a result. */
+.metric-row { display: flex; flex-wrap: wrap; gap: 28px; }
+.metric { display: flex; flex-direction: column; gap: 2px; min-width: 110px; }
+.metric-value { font-size: 20px; font-variant-numeric: tabular-nums; font-weight: 600; }
+.metric-value.muted { color: var(--muted); font-size: 15px; font-weight: 500; }
+.metric-frac { color: var(--muted); font-size: 12px; }
+.metric-note { color: var(--muted); font-size: 11px; max-width: 150px; }
+.muted { color: var(--muted); }

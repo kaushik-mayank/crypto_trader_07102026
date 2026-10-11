@@ -64,6 +64,60 @@ export const api = {
   /** Every source the engine fetches, with its newest row and last value. */
   sources: () => get('api/sources'),
   /**
+   * Live suggestions, optionally narrowed to one model.
+   *
+   * The model is the persisted `strategy_class` integer, passed straight through — the frontend
+   * never derives a model from a strategy id or from display text, because the engine already
+   * stores the classification and a second derivation is a second thing to keep in step.
+   */
+  liveSignalsFiltered: (strategyClass?: string) =>
+    get('api/signals/live', strategyClass ? { strategy_class: strategyClass } : undefined),
+  /**
+   * Suggestion counts and rates for a window, aggregated by the engine.
+   *
+   * The aggregation is deliberately not done here: the browser receives a few dozen numbers
+   * instead of the whole archive, and the UTC day boundary stays on the server where it means the
+   * same thing to every reader.
+   */
+  analytics: (params: { start?: string; end?: string; strategyClass?: string; asset?: string;
+                        state?: string }) => {
+    const search: Record<string, string> = {};
+    if (params.start) search.start = params.start;
+    if (params.end) search.end = params.end;
+    if (params.strategyClass) search.strategy_class = params.strategyClass;
+    if (params.asset) search.asset = params.asset;
+    if (params.state) search.state = params.state;
+    return get('api/analytics', search);
+  },
+  /** Which UTC days have suggestions, with per-day counts. The date picker's index. */
+  signalDays: (strategyClass?: string) =>
+    get('api/signals/days', strategyClass ? { strategy_class: strategyClass } : undefined),
+  /**
+   * One page of past suggestions. Every filter is applied **in SQL** by the engine, so a page is a
+   * page of matches rather than a page of rows that were then filtered down to nothing.
+   */
+  signalHistory: (params: {
+    day?: string;
+    strategyClass?: string;
+    state?: string;
+    asset?: string;
+    limit?: number;
+    cursorMs?: number;
+    cursorId?: string;
+  }) => {
+    const search: Record<string, string> = {};
+    if (params.day) search.day = params.day;
+    if (params.strategyClass) search.strategy_class = params.strategyClass;
+    if (params.state) search.state = params.state;
+    if (params.asset) search.asset = params.asset;
+    if (params.limit) search.limit = String(params.limit);
+    if (params.cursorMs && params.cursorId) {
+      search.cursor_ms = String(params.cursorMs);
+      search.cursor_id = params.cursorId;
+    }
+    return get('api/signals/history', search);
+  },
+  /**
    * Stored OHLCV for the chart.
    *
    * `timeframe` and `limit` are validated and clamped by the engine, not here — the frontend
