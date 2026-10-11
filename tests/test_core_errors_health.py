@@ -220,3 +220,95 @@ def test_a_writable_log_directory_still_gets_its_file_handler(tmp_path):
     get_logger("test").info("written to the file")
     written = (log_dir / "probe.jsonl").read_text(encoding="utf-8")
     assert "written to the file" in written
+
+
+# ---- a model finding is not a fault (F-060) -------------------------------------------------
+
+def test_a_modelling_finding_does_not_make_the_system_operationally_degraded():
+    """F-033 measured the regime model's median dwell at 2.0 bars against a requirement of 3 on BTC
+    and SOL, so `specs/12` §10's degraded mode is in force **permanently and by design**: drop the
+    dwell conditions, keep every raw-axis threshold, run with reduced selectivity.
+
+    Folding that into one `worst_of` over every component made the whole system permanently
+    DEGRADED. The label was the smaller problem. The real one is the second assertion below: a
+    genuine DEGRADED has to be distinguishable from the two that are always there, and it was not.
+    """
+    from core.errors import ProblemClass
+    from core.health import ComponentHealth, HealthReport, SystemStatus
+
+    modelling = ComponentHealth(
+        name="regime:B-BTC_USDT", status=SystemStatus.DEGRADED,
+        detail="the regime model failed its validity tests",
+        problem_class=ProblemClass.MODELLING)
+    report = HealthReport(components=[ComponentHealth.healthy("store"),
+                                      ComponentHealth.healthy("runner"), modelling])
+
+    assert report.status is SystemStatus.DEGRADED, "the overall status still reports everything"
+    assert report.operational_status is SystemStatus.HEALTHY, (
+        "nothing is broken: the data and the code are both fine and a model assumption is not"
+    )
+    assert report.faults() == []
+    assert len(report.modelling_findings) == 1
+
+
+def test_a_real_fault_is_still_visible_alongside_a_permanent_modelling_finding():
+    """The assertion that matters. Two permanent model findings plus one failing poller must report
+    the failing poller — previously all three looked identical."""
+    from core.errors import ProblemClass
+    from core.health import ComponentHealth, HealthReport, SystemStatus
+
+    report = HealthReport(components=[
+        ComponentHealth(name="regime:B-BTC_USDT", status=SystemStatus.DEGRADED, detail="dwell",
+                        problem_class=ProblemClass.MODELLING),
+        ComponentHealth(name="regime:B-SOL_USDT", status=SystemStatus.DEGRADED, detail="dwell",
+                        problem_class=ProblemClass.MODELLING),
+        ComponentHealth(name="ingest:futures_rt", status=SystemStatus.DEGRADED,
+                        detail="4 consecutive failures", problem_class=ProblemClass.EXTERNAL),
+    ])
+    assert report.operational_status is SystemStatus.DEGRADED
+    assert [c.name for c in report.faults()] == ["ingest:futures_rt"]
+    assert len(report.degraded_reasons) == 1, "the reasons list is faults only"
+    assert "futures_rt" in report.degraded_reasons[0]
+    # And the findings are still reported, in their own place.
+    assert {f["name"] for f in report.modelling_findings} == {
+        "regime:B-BTC_USDT", "regime:B-SOL_USDT"}
+
+
+def test_a_modelling_finding_is_never_dropped_from_the_payload():
+    """specs/12 §10: "the degradation is surfaced in the dashboard status panel. A user should be
+    able to see the system is running with a weaker filter set." Separating it from the fault list
+    must not become hiding it."""
+    from core.errors import ProblemClass
+    from core.health import ComponentHealth, HealthReport, SystemStatus
+
+    report = HealthReport(components=[ComponentHealth(
+        name="regime:B-SOL_USDT", status=SystemStatus.DEGRADED,
+        detail="the regime model failed its validity tests",
+        problem_class=ProblemClass.MODELLING,
+        context={"failed_tests": ["persistence"]},
+        remediation="this is a finding about the market, not a fault to fix")])
+    body = report.to_dict()
+
+    assert body["operational_status"] == "HEALTHY"
+    assert body["status"] == "DEGRADED"
+    assert body["fault_count"] == 0
+    finding = body["modelling_findings"][0]
+    assert finding["name"] == "regime:B-SOL_USDT"
+    assert finding["context"]["failed_tests"] == ["persistence"]
+    assert "not a fault" in finding["remediation"]
+    # The component itself is still in the component list, unchanged.
+    assert body["components"][0]["problem_class"] == "modelling"
+
+
+def test_the_degraded_mode_itself_is_not_weakened_to_clear_the_warning():
+    """The classifier must keep reporting DEGRADED when the model is degraded. The fix was to the
+    *aggregation*, and it would be worth nothing if it had been bought by softening this."""
+    import inspect
+
+    from regime.classifier import RegimeClassifier
+
+    source = inspect.getsource(RegimeClassifier.health)
+    assert "if self.model.degraded:" in source
+    assert "SystemStatus.DEGRADED" in source
+    assert "ProblemClass.MODELLING" in source
+    assert "failed_tests" in source

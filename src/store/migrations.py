@@ -194,6 +194,38 @@ MIGRATIONS: list[tuple[int, str, str]] = [
         );
         """,
     ),
+    (
+        3,
+        "setup_state carries the context and trigger time a restart needs to resume (F-062)",
+        """
+        -- Two columns the resume path cannot work without, and whose absence made the existing
+        -- `setup_state` table insufficient for the purpose it was created for.
+        --
+        -- `context` is where a strategy keeps the facts only it knows: C3-C's `inside_is_below`
+        -- (which side price approached the boundary from), C2's monotone `trail_level` and
+        -- `extreme_since_entry`, C3-C's `breaks_seen`. `SetupState.context`'s own docstring calls
+        -- them "needed to re-evaluate invalidation", and they were being dropped on write. Resuming
+        -- without them would silently reset a trailing stop to its starting width and invert C3-C's
+        -- acceptance test — worse than not resuming at all, because it looks like it worked.
+        --
+        -- `triggered_at_ms` is when the hypothetical entry occurred, distinct from `armed_at_ms`
+        -- (when the setup was detected) and from `updated_at_ms` (when this row was last written).
+        --
+        -- Additive, nullable, no backfill: a row written by the previous build simply has NULL and
+        -- the resume path declines to resume it rather than guessing at a context it never saved.
+        ALTER TABLE setup_state ADD COLUMN context TEXT;
+        ALTER TABLE setup_state ADD COLUMN triggered_at_ms INTEGER;
+
+        -- Resume reads by lifecycle. Without this it is a scan of every setup ever armed.
+        CREATE INDEX idx_setup_state_lifecycle ON setup_state (lifecycle, armed_at_ms);
+
+        -- Phase 2A filters suggestions by model, and Phase 2C browses them by date. The signals
+        -- table already has `idx_signals_created (created_at_ms, signal_id)` for the date axis;
+        -- this covers the model axis and the two combined, so a filtered date page stays an index
+        -- range scan instead of a table scan plus a filter.
+        CREATE INDEX idx_signals_class_created ON signals (strategy_class, created_at_ms);
+        """,
+    ),
 ]
 
 

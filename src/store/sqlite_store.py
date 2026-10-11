@@ -56,6 +56,27 @@ PIT_SOURCES = {
 }
 
 
+def _statements(sql: str) -> list[str]:
+    """Split a migration into statements, ignoring semicolons inside ``--`` comments.
+
+    The previous `sql.split(";")` was a trap with a long fuse. Migrations are **forward-only and
+    immutable once released**, so they are written with long explanatory comments — and a semicolon
+    in one of those comments silently cut a statement in half, producing a syntax error pointing at
+    a fragment of English prose. The migration rolled back correctly, so nothing was corrupted, but
+    the author was left debugging ``near "without": syntax error`` against a comment (F-062).
+
+    Comments are stripped line-wise rather than parsed: no migration in this project contains a
+    ``--`` inside a string literal, and the alternative is a SQL tokeniser, which is a great deal of
+    machinery to protect a dozen DDL statements. Verified to produce byte-identical statement lists
+    for every released migration.
+    """
+    stripped = []
+    for line in sql.splitlines():
+        marker = line.find("--")
+        stripped.append(line if marker < 0 else line[:marker])
+    return [s.strip() for s in "\n".join(stripped).split(";") if s.strip()]
+
+
 def _t(v: Decimal | None) -> str | None:
     return None if v is None else str(v)
 
@@ -280,9 +301,8 @@ class SqliteStore:
                 # Statements are executed individually inside one transaction: executescript()
                 # would COMMIT implicitly and make the migration non-atomic.
                 self.conn.execute("BEGIN")
-                for statement in (s.strip() for s in sql.split(";")):
-                    if statement:
-                        self.conn.execute(statement)
+                for statement in _statements(sql):
+                    self.conn.execute(statement)
                 self.conn.execute("INSERT INTO schema_version (version, applied_ms, description) VALUES (?, ?, ?)",
                                   (version, int(time.time() * 1000), description))
                 self.conn.execute("COMMIT")

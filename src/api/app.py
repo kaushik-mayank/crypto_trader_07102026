@@ -67,10 +67,16 @@ class ResponseCache:
             return None
         self.hits += 1
         envelope = entry.result.envelope
+        # Rebuilt field by field so only `served_at_ms` moves. **Every other field must be copied**:
+        # a field added to the envelope and forgotten here is silently dropped for the cache's
+        # lifetime, which is how `modelling_findings` nearly vanished from cached responses the day
+        # it was added. `dataclasses.replace` would be terser and would also copy future fields, but
+        # it would copy `served_at_ms` too and the whole point is that this one does not survive.
         refreshed = type(envelope)(
             served_at_ms=int(time.time() * 1000), data_as_of_ms=envelope.data_as_of_ms,
             system_status=envelope.system_status, sources=dict(envelope.sources),
             degraded_reasons=list(envelope.degraded_reasons),
+            modelling_findings=list(envelope.modelling_findings),
             correlation_id=envelope.correlation_id)
         return ServiceResult(payload=entry.result.payload, envelope=refreshed,
                              error=entry.result.error)
@@ -133,6 +139,7 @@ def status_code_for(result: ServiceResult) -> int:
 
 
 def create_app(*, signals: SignalService, market: MarketService, health: HealthService,
+               analytics: Any = None,
                host: str = "127.0.0.1", auth_token: str = "", public_via_tunnel: bool = False,
                regimes_source: Any = None, features_source: Any = None) -> Any:
     """Build the FastAPI app. Raises before serving if the exposure is not permitted."""
@@ -221,17 +228,35 @@ def create_app(*, signals: SignalService, market: MarketService, health: HealthS
     # ---- JSON -----------------------------------------------------------------------------
 
     @app.get("/api/signals/live")
-    def live(asset: str | None = None) -> Any:
-        key = f"live:{asset or '*'}"
+    def live(asset: str | None = None, strategy_class: str | None = None) -> Any:
+        # The cache key carries **every** parameter that changes the result. Leaving the model
+        # filter out of it would serve one filter's suggestions under another's heading for the
+        # cache's lifetime, which is a wrong answer rather than a stale one.
+        key = f"live:{asset or '*'}:{strategy_class or '*'}"
         cached = cache.get(key)
         if cached is not None:
             return respond(cached)
-        return respond(cache.put(key, signals.live(asset=asset)))
+        return respond(cache.put(key, signals.live(asset=asset, strategy_class=strategy_class)))
 
     @app.get("/api/signals/history")
-    def history(limit: int = 50, cursor_ms: int | None = None, cursor_id: str | None = None) -> Any:
+    def history(limit: int = 50, cursor_ms: int | None = None, cursor_id: str | None = None,
+                day: str | None = None, strategy_class: str | None = None,
+                state: str | None = None, asset: str | None = None) -> Any:
+        """Past suggestions, filtered and paginated **in SQL**.
+
+        Every parameter here narrows a query; none reaches the strategy or risk engines
+        (specs/14 §11). `day` is a UTC calendar day, `strategy_class` one of the four models,
+        `state` a lifecycle state — all validated, so a typo answers 400 with the allowed set
+        rather than an empty page that reads as a quiet day.
+        """
         cursor = (cursor_ms, cursor_id) if cursor_ms is not None and cursor_id else None
-        return respond(signals.history(cursor=cursor, limit=min(limit, 200)))
+        return respond(signals.history(cursor=cursor, limit=min(limit, 200), day=day,
+                                       strategy_class=strategy_class, state=state, asset=asset))
+
+    @app.get("/api/signals/days")
+    def signal_days(limit: int = 120, strategy_class: str | None = None) -> Any:
+        """Which UTC days have suggestions, with per-day counts — the date picker's index."""
+        return respond(signals.days(limit=limit, strategy_class=strategy_class))
 
     @app.get("/api/signals/{signal_id}")
     def detail(signal_id: str) -> Any:
@@ -263,6 +288,29 @@ def create_app(*, signals: SignalService, market: MarketService, health: HealthS
         this reads stored bars and nothing else.
         """
         return respond(market.candles(asset, timeframe=timeframe, limit=limit))
+
+    @app.get("/api/analytics")
+    def analytics_overview(start: str | None = None, end: str | None = None,
+                           strategy_class: str | None = None, asset: str | None = None,
+                           state: str | None = None) -> Any:
+        """Suggestion counts and rates for a window, aggregated in SQL.
+
+        Every parameter narrows a query and none reaches the strategy or risk engines
+        (specs/14 §11). The window defaults to 30 days and is capped at a year, because an
+        unbounded range is a query whose cost grows with the archive.
+        """
+        if analytics is None:
+            # An honest 503 rather than a 404: the route exists and the dependency does not, which
+            # is a wiring problem with a named fix, not a path the dashboard should stop asking for.
+            return JSONResponse(
+                {"error": {"code": "API_ANALYTICS_UNAVAILABLE", "problem_class": "configuration",
+                           "message": "the analytics service is not attached to this API",
+                           "likely_cause": "create_app was called without analytics=",
+                           "remediation": "pass analytics=build_analytics(reader) when building "
+                                          "the app"}},
+                status_code=503)
+        return respond(analytics.overview(start=start, end=end, strategy_class=strategy_class,
+                                          asset=asset, state=state))
 
     @app.get("/api/sources")
     def sources() -> Any:

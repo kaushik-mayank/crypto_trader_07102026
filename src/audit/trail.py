@@ -176,14 +176,25 @@ class AuditTrail:
              _json([c.to_dict() for c in outcome.conditions])))
 
     def _write_setup_state(self, state: SetupState, now: int) -> None:
+        """Persist one armed setup, **including its context**.
+
+        `context` is where a strategy keeps the facts only it knows and only it can re-derive:
+        C3-C's `inside_is_below` (which side price approached the boundary from), C2's monotone
+        `trail_level` and `extreme_since_entry`, the `transitions` log. `SetupState.context`'s own
+        docstring calls them "needed to re-evaluate invalidation", and this method was dropping
+        them on the floor — which made the table insufficient for the one thing it exists for, and
+        is why resuming from it had to add a column before it could add a caller (F-062).
+        """
         self.store.conn.execute(
             """INSERT INTO setup_state (signal_id, strategy_id, asset, product, direction,
                    armed_at_ms, armed_snapshot_id, x_star, e_t, lifecycle, expires_at_ms,
-                   original_entry_price, parameter_hash, strategy_version, updated_at_ms)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   original_entry_price, parameter_hash, strategy_version, context,
+                   triggered_at_ms, updated_at_ms)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(signal_id) DO UPDATE SET
                    x_star=excluded.x_star, e_t=excluded.e_t, lifecycle=excluded.lifecycle,
                    original_entry_price=excluded.original_entry_price,
+                   context=excluded.context, triggered_at_ms=excluded.triggered_at_ms,
                    updated_at_ms=excluded.updated_at_ms""",
             (state.signal_id, state.strategy_id, state.asset, state.product.value,
              state.direction.value, state.armed_at_ms, state.armed_snapshot_id,
@@ -191,7 +202,8 @@ class AuditTrail:
              str(state.e_t) if state.e_t is not None else None,
              state.lifecycle.value, state.expires_at_ms,
              str(state.original_entry_price) if state.original_entry_price is not None else None,
-             state.parameter_hash, state.strategy_version, now))
+             state.parameter_hash, state.strategy_version, _json(state.context),
+             state.triggered_at_ms, now))
 
     def _write_arbitration(self, event: Any, now: int) -> None:
         self.store.conn.execute(

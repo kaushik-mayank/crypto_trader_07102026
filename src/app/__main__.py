@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any
 
 from api.app import create_app
-from api.services import build_services
+from api.services import build_analytics, build_services
+from app.resume import resume_into
 from app.runner import AppRunner, load_classifiers
 from audit.trail import AuditTrail
 from config.parameters import load_registry
@@ -89,7 +90,8 @@ def _serve(runner: AppRunner, settings: Settings, evaluate_once: Any, *,
         return HealthReport(components=[reader.health(), *report.components])
 
     signals, market, health = build_services(reader, health_source=api_health)
-    app = create_app(signals=signals, market=market, health=health,
+    analytics = build_analytics(reader, health_source=api_health)
+    app = create_app(signals=signals, market=market, health=health, analytics=analytics,
                      host=settings.server.host, auth_token=settings.server.auth_token,
                      public_via_tunnel=settings.server.public_via_tunnel,
                      regimes_source=lambda: {a: c.stats() for a, c in runner.classifiers.items()})
@@ -184,6 +186,20 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     audit = AuditTrail(store=store)
+
+    # Resume what was armed when this process last stopped, before the first evaluation runs.
+    #
+    # Before this call, `runner.states` started empty on every start, so a restart abandoned every
+    # armed setup: the rows stayed SETUP_DETECTED/ENTER_NOW/TRIGGERED in the signals table forever
+    # and could never reach TARGET_HIT, STOPPED or EXPIRED, because nothing held their state any
+    # more. The dashboard went on showing them as live suggestions (F-062).
+    #
+    # Deliberately *before* the loop and *after* `build_runner`: the resume needs the registered
+    # strategies and the live parameter hash to decide what may be carried forward, and a setup must
+    # be in hand before the first pass so that pass manages it rather than arming a duplicate.
+    #
+    # `--check` returns above, so a preflight makes no state changes.
+    resume_into(runner, audit, now_ms=int(time.time() * 1000))
 
     def evaluate_once() -> Any:
         result = runner.evaluate(int(time.time() * 1000))

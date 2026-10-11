@@ -1941,6 +1941,293 @@ them to check the other's — not more careful instructions.
 
 ---
 
+---
+
+## F-060 — The regime finding was correct; aggregating it as a fault hid every real one ✅
+
+**Date:** 2026-10-11 · **Problem class:** application_bug · **Fixed**
+
+Reported symptom: the dashboard shows `regime:B-BTC_USDT — DEGRADED — modelling` and
+`regime:B-SOL_USDT — DEGRADED — modelling`, permanently.
+
+### The state is correct and must not be falsified
+
+F-033 measured it on 4,001 stored 1h bars per asset: at 2×2, **BTC and SOL fail the persistence
+test with a median dwell of 2.0 bars against a requirement of 3**, while ETH passes. Occupancy and
+separation pass on all three. `specs/12` §10 prescribes exactly what follows — drop the
+dwell-stability conditions, keep every raw-axis threshold, run with reduced selectivity — and
+`specs/02` §6 is explicit that "a label that flips every bar is not a regime, it is a noisy
+indicator with a fancy name".
+
+So the model really is degraded, on those two assets, permanently, and the classifier reporting
+`DEGRADED` with `ProblemClass.MODELLING` is the system working. **Nothing here was softened to clear
+the warning**, and a test now asserts the classifier still reports it.
+
+### What was actually broken
+
+`HealthReport.status` is `worst_of` over every component, and the envelope took that. One permanent
+model finding therefore made the **entire system** permanently `DEGRADED`:
+
+| | Before | After |
+|---|---|---|
+| envelope `system_status` | DEGRADED, always | HEALTHY when nothing is broken |
+| dashboard health count | "3 healthy, 2 not healthy" | "3 healthy, no faults" + a findings panel |
+| server dashboard | permanent amber DEGRADED banner | a distinct "REDUCED SELECTIVITY" notice |
+| **a genuinely failing poller** | **a third identical DEGRADED line** | the only line in the fault list |
+
+The last row is the defect. The label was cosmetic; the consequence was that a real degradation
+became invisible, because it looked exactly like the two that had been there for weeks. A warning
+that is always on is a warning nobody reads — the same failure as F-052, arriving by a different
+route.
+
+`ProblemClass.MODELLING` was created to draw precisely this line, and its own docstring says so:
+*"the triage answer is 'read the finding', not 'check the feed' or 'fix the code': paging someone
+would waste the page."* The distinction was declared in `core/errors.py` and discarded one layer
+above, in `core/health.py`.
+
+### The change
+
+* `HealthReport.operational_status` — worst status among components that are **not** model
+  findings. `status` is unchanged and still reports everything.
+* `HealthReport.faults()`, `modelling_components`, `modelling_findings`; `degraded_reasons` is now
+  faults only.
+* `to_dict()` publishes `operational_status`, `fault_count` and `modelling_findings` alongside the
+  unchanged `status` and component list.
+* The envelope carries `operational_status` and a `modelling_findings` list — so the finding
+  travels with **every** response, not just `/api/health`.
+* `HealthService.health()` was overriding the envelope with `report.status`; it now passes
+  `operational_status`.
+* Both dashboards render findings in a panel of their own, naming the asset and the failing test.
+  `specs/12` §10 requires the degradation visible ("a user should be able to see the system is
+  running with a weaker filter set"); it does not require it to look like something broke.
+
+Verified both ways: findings alone → envelope HEALTHY, no fault banner, finding panel shown;
+findings **plus** a failing poller → envelope DEGRADED, the poller named as the single fault, the
+findings still shown.
+
+---
+
+## F-061 — C1-C's negative values are correct, and nothing was testing the one thing that could invert them ✅
+
+**Date:** 2026-10-11 · **Problem class:** none (verified correct) · **Tests added**
+
+Traced the full path for the reported `entry -0.04145262148598610125 / stop -0.0451935447161604650 /
+target 0` on a **LONG** C1-C card.
+
+`specs/03` §5 defines C1-C on the **residual** — a beta-adjusted log-return spread against BTC
+— not on a price:
+
+| Field | Spec | Observed | Verdict |
+|---|---|---|---|
+| entry | "ACT applied to the **spread series**, U = rolling σ of the residual" | −0.0414 | correct: a residual, not a price |
+| stop | "residual extends beyond `X* ± s_rs·σ`" | −0.0452 | correct: below entry for a LONG |
+| target | "residual returns to its rolling mean, **zero by construction**" | 0 | correct |
+| direction | "**long the underperformer**, short the outperformer" | LONG at z < 0 | correct |
+
+A negative residual means the asset returned *less* than its beta against BTC explains — it is the
+underperformer — so the correction trade is to buy it. The ordering `stop < entry < target = 0` is
+therefore exactly right, and all three terms are negative except the target. **These are expected
+signed values under the canonical definition, not a sign error, not a unit mismatch, and not a
+rounding artifact.** The defect was that the dashboard printed them under a heading marked *entry*
+(F-051), which is fixed.
+
+What the investigation did find is that **nothing tested the sign convention.** It lives in one
+character — `direction = Direction.LONG if z < 0 else Direction.SHORT` — and inverting it would
+make the system short every dislocated-cheap asset indefinitely, with no error raised, no validity
+gate tripped, and every published number still looking entirely plausible. Five tests now pin it:
+the residual is `own − beta·bench` (hand-computed), beta scales the benchmark leg only, a negative
+residual goes long, the level ordering holds, and degenerate windows raise instead of publishing a
+sign.
+
+---
+
+
+---
+
+## F-062 — Every restart abandoned every armed setup, and the code to prevent it had no callers ✅
+
+**Date:** 2026-10-11 · **Problem class:** application_bug · **Fixed**
+
+`AuditTrail.open_setups()` existed. Its docstring read *"armed setups, for a restart to resume from
+(specs/13 §11.1)"*. It had **no callers**, and `AppRunner.states` is `field(default_factory=dict)`.
+
+So every start of `crypto-app` began with no armed setups. Every setup that had been
+`SETUP_DETECTED`, `ENTER_NOW` or `TRIGGERED` when the process stopped was silently abandoned: its
+row stayed in the `signals` table in an active state **permanently**, because the only thing that
+could have moved it — `strategy/lifecycle.py:progress()` — needs a `SetupState` that no longer
+existed. It could never reach `TARGET_HIT`, `STOPPED` or `EXPIRED`. The dashboard went on listing it
+as a live suggestion indefinitely.
+
+This is the **third** instance of one pattern: code written, tested in isolation, never wired to a
+caller. F-043 was the serve loop that evaluated once. F-054 was `to_price`, which implemented
+specs/08 §10's rounding rule and was called by nothing but its own tests. All three were invisible
+for the same reason — **the thing that should have failed simply never ran**, so no test failed, no
+error was logged, and the symptom appeared somewhere far away as data that looked stale. There is
+now a test asserting the caller exists, for each.
+
+### The second defect, found while fixing the first
+
+`setup_state` could not support a resume even once something read it. The table had no `context`
+column and no `triggered_at_ms`, and `_write_setup_state` dropped both.
+
+`SetupState.context` is where a strategy keeps the facts only it knows — its own docstring calls
+them "needed to re-evaluate invalidation": C2's monotone `trail_level` and `extreme_since_entry`,
+C3-C's `inside_is_below` (which side price approached the boundary from), C3-C's `breaks_seen`.
+Resuming without them would have **reset a trailing stop to its starting width** — loosening a stop
+the spec requires never to loosen — and **inverted C3-C's acceptance test**. Both silently, both
+producing a plausible suggestion computed from facts that had been thrown away.
+
+So the fix needed a migration before it could need a caller. Migration 3 adds `context` and
+`triggered_at_ms` (additive, nullable, no backfill) plus two indexes. Applied to the 6.2 GB
+development database in **0.01 s** with 21.9 M bars intact, and verified to upgrade a populated v2
+database without touching its rows.
+
+### What resumes, and what deliberately does not
+
+specs/13 §11.1 requires each persisted setup to be re-evaluated rather than trusted. `app/resume.py`
+rehydrates state — with the **original `armed_at_ms`**, so `X*` spans the right window and expiry
+counts from the right moment — and hands it to the existing evaluation path. It adds no second
+evaluator: a resumed setup is managed by exactly the same code as one armed a minute ago, which is
+the only way live and backtest can agree.
+
+| Refused when | Why |
+|---|---|
+| past expiry | specs/13 §11.1 step 4 |
+| `parameter_hash` differs | not the setup those parameters would arm now; mixing two parameter sets in one signal's provenance makes the audit record unreplayable |
+| `strategy_version` differs | same reasoning |
+| `context` is SQL NULL | written before migration 3. The facts were never saved, and **declining is conservative while guessing is not** |
+| strategy no longer registered | nothing to evaluate it |
+| a second open setup for one `(strategy, asset)` | the runtime holds one by design (`specs/04` §6); the newest wins and the loser is named in the log |
+
+A refused setup is **not transitioned** by the loader. Inventing a terminal state for a setup this
+process never observed would be rewriting history it did not witness — and specs/13 §11.2 makes the
+same point about the adjacent case, requiring a trigger that fired during an outage to be `MISSED`,
+never `TRIGGERED`, "because the user had no opportunity to act". A test asserts the loader contains
+no `transition()` call at all.
+
+### And a trap in the migration applier
+
+Migration 3 would not apply: `near "without": syntax error`. The applier split statements on
+`sql.split(";")`, and a semicolon **inside a `--` comment** cut a statement in half. Migrations are
+forward-only and immutable once released, so they carry long explanatory comments; the next author
+to write one with a semicolon in it would have debugged a syntax error pointing at a fragment of
+English prose. The splitter now strips line comments first, verified to produce identical statement
+lists for both released migrations.
+
+---
+
+## F-063 — The "legacy display date" would overwrite good data, because there is no legacy gap
+
+**Date:** 2026-10-11 · **Problem class:** none (requirement conflict) · **Not applied — awaiting a decision**
+
+Phase 2E of the request asks that legacy suggestions be stamped with a display date of **10 October
+2026, 23:11**, on the assumption that older records lack a usable timestamp.
+
+Checked before building it, and the assumption does not hold:
+
+* `signals.created_at_ms` is **`INTEGER NOT NULL`** and has been since migration 2 — the schema that
+  created the table. There has never been a signal row without one.
+* It is written as the wall-clock time of the first insert, and it is **deliberately absent** from
+  `_write_signal`'s `ON CONFLICT DO UPDATE SET` list, so it does not move when a later outcome
+  updates the row. It is already the stable issue timestamp Phase 2B asks for.
+* `SELECT COUNT(*) FROM signals WHERE created_at_ms IS NULL OR created_at_ms = 0` returns **0**.
+
+So there is no missing-timestamp problem to repair. Writing 10 Oct 23:11 over those values would
+replace accurate data with a fabricated constant, which the request's own constraints forbid in four
+places — "do not silently alter historical records", "preserve the underlying original data wherever
+possible", "do not fabricate results", "legacy suggestions retain their existing rules and
+historical values".
+
+**Not applied, and not skipped silently.** The capability is the easy part; the question is whether
+it should run. Three options, with the trade-off in each:
+
+1. **Do nothing.** Legacy suggestions display their real issue time. Nothing is lost, and the
+   request's literal instruction is not followed.
+2. **A display-only compatibility column.** Add nullable `legacy_display_ms`, set it only for rows
+   created before a recorded cutoff, publish both, and label it in the UI as a legacy display date
+   with the true timestamp beside it. Non-destructive, auditable, reversible — but it still shows a
+   reader a date that is not when the suggestion was issued.
+3. **Overwrite `created_at_ms`.** Follows the instruction exactly and destroys the real timestamps.
+   Refused: it is irreversible, and it would silently move historical suggestions between date
+   groups.
+
+Option 2 is the one the request itself points at ("the safest minimal database migration or
+compatibility-layer approach"), and it is what will be built if the owner confirms. The owner may
+also have meant something this finding has not considered — a *presentational* grouping for records
+from before the dashboard existed, say — which is the other reason to ask rather than guess. The
+development database holds **zero** signals, so the only records this would touch are on the VM,
+where the selection criteria cannot be verified from here either.
+
+---
+
+## F-064 — "Target hit versus stopped" is not a partition, and treating it as one understates both rates ✅
+
+**Date:** 2026-10-11 · **Problem class:** none (design decision, recorded before it could become a defect)
+
+Phase 3 asked for target-hit and stop-loss counts and rates. The obvious implementation is
+`TARGET_HIT / (TARGET_HIT + STOPPED)` and stop there. Checked against the lifecycle first, and the
+obvious implementation would have been quietly wrong.
+
+`specs/07` §8 defines **eleven** states. Seven are terminal, and **only two of them are a trade
+result**:
+
+| Bucket | States | What it means |
+|---|---|---|
+| open | `SETUP_DETECTED`, `ENTER_NOW`, `TRIGGERED` | still being tracked; no outcome yet |
+| **resolved** | `TARGET_HIT`, `STOPPED` | the only two that are a trade result |
+| ended, no result | `EXPIRED`, `INVALIDATED`, `SUPPRESSED`, `MISSED`, `HANDED_OFF` | genuine outcomes in which no trade result exists |
+
+On the twelve-row verification fixture those five are **five of twelve suggestions** — more than the
+two that resolved. Two ways to get this wrong, and they fail in opposite directions:
+
+* **Put them in the denominator** (`TARGET_HIT / all terminal`) and the win rate reads 3/10 = 30%
+  instead of 3/5 = 60%, understating every strategy because most suggestions never produce a result.
+* **Drop them entirely** and the page hides most of what the system did — including the case that
+  matters operationally, which is everything being `SUPPRESSED` by arbitration or `MISSED` during an
+  outage.
+
+So each is counted, named and reported in its own bucket, and the page shows the buckets adding up to
+the total so none can be silently dropped from a denominator without the arithmetic visibly failing.
+
+### Five rates, each publishing its own denominator
+
+"The hit rate" is ambiguous and both readings are legitimate, so neither is called "the" rate:
+
+| Rate | On the fixture | Reading |
+|---|---|---|
+| `target_hit_of_resolved` | 3/5 = **60%** | of the suggestions that reached a trade result, how many worked |
+| `target_hit_of_all` | 3/12 = **25%** | of everything issued, how much worked |
+| `resolved_of_all` | 5/12 = 42% | how much of the output is measurable at all |
+| `triggered_of_all` | 6/12 = 50% | how often a hypothetical entry actually occurred |
+
+Every rate travels with its numerator, denominator and a prose definition, so any number on the page
+can be checked against a direct query without trusting the service. **A zero denominator yields
+`None`, never `0.0`** — `0%` reads as "nothing ever hit", which is a claim about the market, where
+"not defined" is a claim about the sample and is the true one.
+
+`INVALIDATED` is deliberately **excluded** from the triggered count: it is reachable from
+`SETUP_DETECTED` as well as from `TRIGGERED`, and the current state alone cannot say which, so
+counting it would inflate that denominator by an unknown amount.
+
+### Verification
+
+Every figure cross-checked against a direct `COUNT(*)` over the same fixture rather than against the
+service's own output — 32 tests, including the midnight-boundary case (a suggestion at exactly
+00:00:00.000 UTC must be counted on one day, or two single-day windows total more than the two-day
+window containing them).
+
+No joins anywhere in the service: a join to `signal_events` to pick up a transition time would
+multiply rows per signal and inflate every count, which is the classic way an analytics page starts
+lying. Demonstrated by inserting four events for one signal and asserting the counts do not move.
+
+### What the page refuses to imply
+
+Nothing in this system has been validated (`specs/09`), outcomes are hypothetical — `TRIGGERED`
+tracks a trade nobody was required to take — and no cost or slippage is deducted. The engine
+**generates** the limitations list from the data, so the small-sample warning appears because the
+sample is small rather than because someone remembered to write it down, and the page renders it
+**above** the figures rather than in a footnote. A number on a dashboard acquires authority the
+number itself has not earned.
 ## Open questions
 
 

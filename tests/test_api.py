@@ -1018,3 +1018,82 @@ def test_the_two_dashboards_use_the_same_fallbacks():
     for token in ("two_leg", "levels_are", "entry_triggers"):
         assert token in server, f"{token} fallback missing from render.py"
         assert token in frontend, f"{token} fallback missing from honesty.ts"
+
+
+# ---- the health endpoint and both dashboards separate findings from faults (F-060) ---------
+
+def _modelling_report(*extra):
+    from core.errors import ProblemClass
+
+    return HealthReport(components=[
+        ComponentHealth.healthy("store:read", detail="ok"),
+        ComponentHealth.healthy("runner", detail="12 evaluation(s)"),
+        ComponentHealth.healthy("regime:B-ETH_USDT", detail="usable, 2x2"),
+        ComponentHealth(name="regime:B-BTC_USDT", status=SystemStatus.DEGRADED,
+                        detail="the regime model failed its validity tests",
+                        problem_class=ProblemClass.MODELLING,
+                        context={"failed_tests": ["persistence"]}),
+        ComponentHealth(name="regime:B-SOL_USDT", status=SystemStatus.DEGRADED,
+                        detail="the regime model failed its validity tests",
+                        problem_class=ProblemClass.MODELLING,
+                        context={"failed_tests": ["persistence"]}),
+        *extra])
+
+
+def test_the_health_endpoint_does_not_report_degraded_for_a_model_finding(store):
+    """Reproduces the reported dashboard exactly: BTC and SOL degraded on modelling, nothing else
+    wrong. The envelope must read HEALTHY — nothing is broken — while the finding stays visible."""
+    _, _, health = build_services(store, health_source=_modelling_report)
+    result = health.health()
+
+    assert result.envelope.system_status is SystemStatus.HEALTHY
+    assert result.payload["status"] == "DEGRADED", "the full report still says what it says"
+    assert result.payload["operational_status"] == "HEALTHY"
+    assert result.payload["fault_count"] == 0
+    assert result.payload["degraded_reasons"] == []
+    assert [f["name"] for f in result.payload["modelling_findings"]] == [
+        "regime:B-BTC_USDT", "regime:B-SOL_USDT"]
+    assert result.envelope.to_dict()["modelling_findings"], "the envelope carries it too"
+
+
+def test_a_real_fault_beside_two_permanent_findings_is_still_reported(store):
+    """The assertion the whole change is for. Previously the failing poller was the third identical
+    DEGRADED line on a panel that had read DEGRADED for weeks."""
+    from core.errors import ProblemClass
+
+    failing = ComponentHealth(name="ingest:futures_rt", status=SystemStatus.DEGRADED,
+                              detail="4 consecutive failures",
+                              problem_class=ProblemClass.EXTERNAL)
+    _, _, health = build_services(store, health_source=lambda: _modelling_report(failing))
+    result = health.health()
+
+    assert result.envelope.system_status is SystemStatus.DEGRADED
+    assert result.payload["fault_count"] == 1
+    assert len(result.payload["degraded_reasons"]) == 1
+    assert "futures_rt" in result.payload["degraded_reasons"][0]
+    assert len(result.payload["modelling_findings"]) == 2, "findings are still reported"
+
+
+def test_the_server_dashboard_shows_a_finding_without_a_fault_banner(store):
+    """specs/12 §10 wants the degradation visible. It does not want it to look like a fault, and for
+    months it did."""
+    from api.render import render_envelope
+
+    _, _, health = build_services(store, health_source=_modelling_report)
+    html = render_envelope(health.health())
+
+    assert "banner modelling" in html
+    assert "REDUCED SELECTIVITY" in html
+    assert "not a fault" in html
+    assert "regime:B-BTC_USDT" in html and "regime:B-SOL_USDT" in html
+    assert "banner degraded" not in html and "banner down" not in html
+
+
+def test_a_signals_response_is_not_marked_degraded_by_a_model_finding(store):
+    """The envelope answers "how much should I trust this payload". A dwell-stability failure does
+    not make the prices in a signals response less current."""
+    insert_signal(store)
+    signals, _, _ = build_services(store, health_source=_modelling_report)
+    result = signals.live()
+    assert result.envelope.system_status is SystemStatus.HEALTHY
+    assert len(result.envelope.modelling_findings) == 2

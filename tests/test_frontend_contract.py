@@ -695,3 +695,201 @@ def test_update_sh_does_not_let_already_up_to_date_read_as_success():
     assert "git push" in script
     # And it verifies the routes after restarting, while someone is still watching.
     assert "routes the dashboard needs" in script
+
+
+def test_the_vercel_health_panel_separates_findings_from_faults():
+    """Both dashboards, same rule. The Vercel panel counted the two permanent regime findings in
+    "2 not healthy", which is where the reported screen came from (F-060)."""
+    panels = _without_comments(_require(FRONTEND / "components" / "Panels.tsx"))
+    assert "'modelling'" in panels, "the panel must know the modelling problem class by name"
+    assert "const operational" in panels and "const faults" in panels
+    assert "operational.length - faults.length" in panels, (
+        "the healthy count must be over operational components, not over everything"
+    )
+    # And the finding is still shown, prominently, in its own panel.
+    source = _require(FRONTEND / "components" / "Panels.tsx")
+    assert "Running with reduced selectivity" in source
+    assert "not a fault and there is nothing to fix" in source
+    assert "failed_tests" in source, "the specific failing test is the actionable detail"
+
+
+def test_the_modelling_class_name_matches_the_engines_enum():
+    """A string literal in TypeScript against a Python enum. If the enum value changes, the panel
+    silently stops recognising findings and they become faults again."""
+    from core.errors import ProblemClass
+
+    panels = _require(FRONTEND / "components" / "Panels.tsx")
+    assert f"'{ProblemClass.MODELLING.value}'" in panels
+
+
+# ---- Phase 2: model filters, timestamps, live vs history ------------------------------------
+
+def test_the_dashboards_model_filter_uses_the_persisted_class_not_display_text():
+    """The classification is already `signals.strategy_class`. Deriving a model from a strategy id
+    or a label would be a second derivation to keep in step with the first, and the task is explicit:
+    never infer the model when an authoritative identifier exists."""
+    page = _without_comments(_require(FRONTEND / "app" / "page.tsx"))
+    api_ts = _without_comments(_require(FRONTEND / "lib" / "api.ts"))
+    assert "liveSignalsFiltered" in page and "strategy_class" in api_ts
+    assert "strategy_class" not in page or "signal.strategy_class" in _require(
+        FRONTEND / "components" / "Suggestions.tsx"), (
+        "the class is read from the row, never parsed out of a strategy id"
+    )
+    suggestions = _require(FRONTEND / "components" / "Suggestions.tsx")
+    assert "m.id === String(signal.strategy_class)" in suggestions
+
+
+def test_the_model_labels_come_from_the_engine():
+    """`/api/signals/live` publishes `models`, built from `STRATEGY_CLASSES`, which mirrors the
+    canonical spec titles. A hard-coded list in the frontend would be a fifth place to edit."""
+    from api.services import STRATEGY_CLASSES
+
+    suggestions = _require(FRONTEND / "components" / "Suggestions.tsx")
+    assert "payload?.models" in suggestions, "the engine's map is preferred"
+    # The fallback exists only for an older engine, and must agree with the engine where it is used.
+    for meta in STRATEGY_CLASSES.values():
+        assert meta["short"] in suggestions, f"{meta['short']} missing from the fallback labels"
+
+
+def test_all_four_models_are_offered_plus_an_explicit_all():
+    """An absent chip meaning "all" is a filter nobody can find. Four models and an All."""
+    from api.services import STRATEGY_CLASSES
+
+    suggestions = _require(FRONTEND / "components" / "Suggestions.tsx")
+    assert len(STRATEGY_CLASSES) == 4
+    assert "onChange('')" in suggestions and ">\n          All\n        </button>" in suggestions \
+        or "All" in suggestions
+
+
+def test_the_dashboard_shows_the_suggestion_issue_time_in_utc():
+    """The day grouping is UTC, so the timestamp must be too: a suggestion issued at 23:30 UTC would
+    otherwise sit under one date in its heading and another in its own stamp, for every reader east
+    of Greenwich — and "look at the 10th" would mean different sets to two people."""
+    suggestions = _require(FRONTEND / "components" / "Suggestions.tsx")
+    assert "export function utcStamp" in suggestions
+    assert "getUTCFullYear" in suggestions and "getUTCHours" in suggestions
+    assert "UTC" in suggestions, "the label must say which zone, or the number is ambiguous"
+    assert "created_at_ms" in suggestions, "the issue time is what is displayed"
+
+
+def test_the_dashboard_distinguishes_the_issue_time_from_the_outcome_time():
+    """Showing one timestamp would make a suggestion issued on Tuesday whose stop was hit on
+    Thursday look like a Thursday suggestion."""
+    suggestions = _require(FRONTEND / "components" / "Suggestions.tsx")
+    assert "state_since_ms" in suggestions
+    assert "outcome recorded" in suggestions
+    assert ">issued<" in suggestions or "issued" in suggestions
+
+
+def test_history_is_paged_and_never_fetches_the_whole_table():
+    """The task's efficiency constraint, asserted where it would be violated. A browser that fetches
+    every suggestion to group them locally grows without bound and moves the date boundary into the
+    viewer's timezone."""
+    page = _without_comments(_require(FRONTEND / "app" / "page.tsx"))
+    assert "HISTORY_PAGE" in page
+    assert "api.signalHistory" in page and "api.signalDays" in page
+    # The day index is an aggregate from the engine, not a client-side group-by.
+    assert "reduce(" not in page, "aggregation belongs in SQL, not in the browser"
+
+
+def test_the_live_poll_stops_when_the_history_view_is_open():
+    """Polling a view nobody is looking at spends the proxy's budget and the VM's cycles to refresh
+    a panel that is off screen."""
+    page = _require(FRONTEND / "app" / "page.tsx")
+    assert "if (view !== 'live') return undefined;" in page
+
+
+def test_the_day_index_is_not_polled_on_a_timer():
+    """Past days do not gain suggestions. Re-polling them is requests spent to receive the same
+    answer."""
+    page = _require(FRONTEND / "app" / "page.tsx")
+    index_effect = page.split("api.signalDays", 1)[1][:400]
+    assert "setInterval" not in index_effect
+
+
+def test_an_empty_filter_combination_reads_as_empty_not_broken():
+    """specs/15 failure mode 1 applied to the new filters: an empty result must state why it is
+    empty, and must not look like the engine failed."""
+    page = _require(FRONTEND / "app" / "page.tsx")
+    assert "Nothing matches these filters" in page
+    assert "empty result, not a failure" in page
+    assert "Other models may have" in page, (
+        "a model filter hiding other models' suggestions should say so"
+    )
+
+
+# ---- the analytics page (Phase 3) -----------------------------------------------------------
+
+def test_the_analytics_page_exists_and_is_reachable():
+    page = _require(FRONTEND / "app" / "analytics" / "page.tsx")
+    nav = _require(FRONTEND / "components" / "Nav.tsx")
+    proxy = _require(PROXY_TS)
+    assert "'/analytics'" in nav, "the page must be linked or nobody will find it"
+    assert "'api/analytics'" in proxy, "and allow-listed or it 404s through the proxy"
+    assert "api.analytics" in page
+
+
+def test_every_analytics_rate_is_rendered_with_its_numerator_and_denominator():
+    """A percentage on its own is unverifiable and, over a tiny sample, misleading: `100%` from one
+    resolved suggestion is not a result. The fraction is what makes the figure checkable against a
+    direct query."""
+    page = _require(FRONTEND / "app" / "analytics" / "page.tsx")
+    assert "rate.numerator" in page and "rate.denominator" in page
+    assert "metric-frac" in page
+
+
+def test_the_analytics_page_never_renders_an_undefined_rate_as_zero():
+    """`0%` reads as "nothing ever hit", which is a claim about the market. "Not defined" is a claim
+    about the sample, which is the true one."""
+    page = _without_comments(_require(FRONTEND / "app" / "analytics" / "page.tsx"))
+    assert "'not defined'" in page
+    assert "rate.value === null" in page
+
+
+def test_the_analytics_page_shows_the_limitations_before_the_numbers():
+    """A number on a dashboard acquires authority it has not earned. The engine generates the
+    limitations from the data so they cannot go stale, and the page must put them above the figures
+    rather than in a footnote."""
+    page = _require(FRONTEND / "app" / "analytics" / "page.tsx")
+    assert "What these numbers are not" in page
+    assert page.index("limitations") < page.index("<h2>Rates</h2>"), (
+        "the caveat has to come before the figure it qualifies"
+    )
+
+
+def test_the_analytics_page_does_not_aggregate_in_the_browser():
+    """The engine returns a few dozen counts. A browser that fetched the archive to group it would
+    grow without bound and would compute the date boundary in the viewer's timezone."""
+    page = _without_comments(_require(FRONTEND / "app" / "analytics" / "page.tsx"))
+    for forbidden in (".reduce(", ".filter((s", "signals.length"):
+        assert forbidden not in page, f"{forbidden} suggests client-side aggregation"
+    assert "data.totals" in page or "totals." in page
+
+
+def test_the_analytics_page_does_not_poll():
+    """Counts over a window of whole days change when a suggestion resolves, not every fifteen
+    seconds. Re-running four GROUP BY queries on a timer would spend the VM's cycles to redraw
+    identical numbers."""
+    page = _require(FRONTEND / "app" / "analytics" / "page.tsx")
+    assert "setInterval" not in page
+
+
+def test_the_analytics_page_explains_the_two_denominators():
+    """The page shows both readings of "hit rate" and must say why they differ, or a reader will
+    assume the larger one is the real one."""
+    # Whitespace-normalised: prose inside JSX wraps across lines, so a raw substring check fails on
+    # text that is present. Collapsing runs of whitespace is how every prose assertion here should
+    # be written.
+    page = " ".join(_require(FRONTEND / "app" / "analytics" / "page.tsx").split())
+    assert "share a denominator" in page
+    assert "of the suggestions that reached a trade result" in page
+
+
+def test_the_four_pages_are_all_in_the_nav():
+    """The navigation is the only way to reach three of them."""
+    nav = _require(FRONTEND / "components" / "Nav.tsx")
+    for href in ("'/'", "'/chart'", "'/data'", "'/analytics'"):
+        assert href in nav, f"{href} is missing from the nav"
+    for path in ("app/page.tsx", "app/chart/page.tsx", "app/data/page.tsx",
+                 "app/analytics/page.tsx"):
+        assert (FRONTEND / path).exists(), f"{path} does not exist"

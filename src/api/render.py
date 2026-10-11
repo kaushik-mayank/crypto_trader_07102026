@@ -81,6 +81,19 @@ def render_envelope(result: ServiceResult) -> str:
     elif status is SystemStatus.WARMING:
         banner = ('<div class="banner warming">WARMING — features are still accumulating history. '
                   'This is not a failure.</div>')
+
+    # A model finding gets its own line, below any fault banner and visually distinct from one.
+    # `specs/12` §10 requires the reader to be able to see that the system is running with a weaker
+    # filter set; it does not require that to look like something broke, and for months it did
+    # (F-060). Named per asset, because the degradation is per-asset: F-033 found BTC and SOL fail
+    # the dwell test and ETH passes, so the system runs mixed mode and the panel must say which.
+    if env.modelling_findings:
+        names = ", ".join(_esc(f.get("name", "?")) for f in env.modelling_findings)
+        banner += ('<div class="banner modelling">REDUCED SELECTIVITY — '
+                   f'{names}: the regime model failed its dwell-stability test on these assets, so '
+                   'the dwell conditions are dropped and the raw-axis thresholds still apply. '
+                   '<strong>This is a finding about the market, not a fault</strong> (specs/12 §10).'
+                   '</div>')
     return (f'{banner}<div class="envelope {age_class(env.age_seconds)}">'
             f'<span class="status">{_esc(status.value)}</span> · '
             f'<span class="age">{age_text(env.age_seconds)}</span></div>')
@@ -349,6 +362,11 @@ body { background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, sans
    words as well as colour — the words are the cue that survives a monochrome print or a reader who
    cannot distinguish the palette. */
 .card.dir-pending { border-left: 3px solid var(--act); }
+/* A model finding, deliberately NOT styled like the fault banners: same prominence, different
+   meaning. The purple is the "stale/modelling" token, already distinct from down-red and
+   degraded-amber, and the word "FINDING" carries it for a reader who cannot separate the hues. */
+.banner.modelling { background: transparent; color: var(--stale);
+                    border: 1px solid var(--stale); font-weight: 500; }
 .pending { color: var(--act); margin: .5rem 0; }
 .spread-note { color: var(--act); margin: .5rem 0; }
 .level.muted span { color: var(--muted); }

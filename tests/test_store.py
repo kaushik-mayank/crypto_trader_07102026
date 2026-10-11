@@ -62,7 +62,12 @@ def test_a_database_from_a_newer_build_is_refused_not_downgraded(tmp_path):
     with SqliteStore(p) as s, pytest.raises(MigrationError) as ei:
         s.migrate()
     assert "NEWER build" in ei.value.likely_cause
-    assert ei.value.context["applied"] == [1, 2, 99]
+    # Derived from the migration list, not a literal: this assertion is about the *unknown* version
+    # being reported, and hard-coding the known ones made every future migration break the test for
+    # a reason that has nothing to do with what it checks.
+    from store.migrations import MIGRATIONS
+
+    assert ei.value.context["applied"] == [*sorted(v for v, _, _ in MIGRATIONS), 99]
 
 
 def test_require_schema_fails_fast_when_migrations_were_never_run(tmp_path):

@@ -1125,3 +1125,108 @@ def test_c1c_declares_its_levels_as_residual_units():
     assert "price_basis=RESIDUAL_BASIS" in source, \
         "C1-C must declare its basis, or every consumer has to know about C1-C specifically"
     assert RESIDUAL_BASIS != "price"
+
+
+# ---- C1-C's sign convention, pinned (Phase 1B) ----------------------------------------------
+#
+# The investigation found the negative values correct: `specs/03` §5 defines C1-C on the **residual**
+# (a beta-adjusted log-return spread), not on a price. Its entry, stop and target are therefore
+# small, signed, and negative for roughly half of all LONG setups. The defect was presentational
+# (F-051) and the arithmetic was never wrong.
+#
+# What these tests exist for is the thing that *would* be catastrophic and invisible: an inverted
+# direction. `direction = LONG if z < 0` encodes "long the underperformer" in one character. Flip it
+# and the system suggests shorting whatever is cheap, forever, with no error anywhere and every
+# number still looking plausible. There was no test on it.
+
+def test_the_residual_is_own_minus_beta_times_benchmark():
+    """The definition, hand-computed. If the subtraction were the other way round every sign in the
+    strategy would invert and nothing downstream would notice."""
+    import numpy as np
+
+    from strategy.c1c_relative import residual_from_windows
+
+    # Own asset up 1% then flat; benchmark up 2% then flat; beta 1.0.
+    own = np.array([100.0, 101.0, 101.0])
+    bench = np.array([100.0, 102.0, 102.0])
+    out = residual_from_windows(own, bench, 1.0)
+    # log(1.01) - log(1.02) = -0.00985...; second step is 0 - 0 = 0.
+    assert out.shape == (2,)
+    assert out[0] == pytest.approx(np.log(1.01) - np.log(1.02), abs=1e-12)
+    assert out[0] < 0, "underperforming the benchmark must produce a NEGATIVE residual"
+    assert out[1] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_beta_scales_the_benchmark_leg_not_the_own_leg():
+    """Hand-computed at beta 0.5: the hedge is beta-weighted, so halving beta halves the benchmark's
+    contribution and the residual moves toward zero."""
+    import numpy as np
+
+    from strategy.c1c_relative import residual_from_windows
+
+    own = np.array([100.0, 101.0])
+    bench = np.array([100.0, 102.0])
+    full = residual_from_windows(own, bench, 1.0)[0]
+    half = residual_from_windows(own, bench, 0.5)[0]
+    assert full == pytest.approx(np.log(1.01) - np.log(1.02), abs=1e-12)
+    assert half == pytest.approx(np.log(1.01) - 0.5 * np.log(1.02), abs=1e-12)
+    assert half > full, "a smaller beta subtracts less of the benchmark"
+
+
+def test_a_negative_residual_goes_long_the_underperformer():
+    """`specs/03` §5: **"long the underperformer, short the outperformer, sized to be beta-neutral."**
+
+    A negative residual means the asset returned less than its beta against BTC explains, so it is
+    the underperformer and the correction trade is to buy it. Inverting this single comparison would
+    make the system short every dislocated-cheap asset indefinitely, with no error raised, no
+    validity gate tripped, and every published number still looking entirely reasonable.
+    """
+    import inspect
+
+    from strategy.c1c_relative import C1C
+
+    source = inspect.getsource(C1C)
+    assert "direction = Direction.LONG if z < 0 else Direction.SHORT" in source, (
+        "the direction rule changed; confirm against specs/03 §5 before accepting it"
+    )
+
+
+def test_a_long_residual_stop_sits_below_entry_and_the_target_is_zero():
+    """`specs/03` §5: stop = "residual extends beyond X* ± s_rs·sigma"; target = "residual returns to
+    its rolling mean, which is zero by construction".
+
+    So for a LONG the ordering is `stop < entry < target = 0`, every term negative except the
+    target. That ordering is what makes the dashboard's `entry -0.0414 / stop -0.0451 / target 0`
+    correct rather than a sign error, and it is asserted here so the claim is checkable.
+    """
+    import inspect
+    from decimal import Decimal
+
+    from strategy.c1c_relative import C1C
+    from strategy.evaluation import RESIDUAL_BASIS
+
+    source = inspect.getsource(C1C._levels)
+    assert "act_state.x_star - s_rs * sigma if direction is Direction.LONG" in source
+    assert "targets=(Decimal(0),)" in source, "the target is zero by construction, not a price"
+    assert "price_basis=RESIDUAL_BASIS" in source
+
+    # The ordering itself, hand-computed on the values the dashboard displayed.
+    entry, sigma, s_rs = Decimal("-0.0414"), Decimal("0.0012"), Decimal("3.1")
+    stop = entry - s_rs * sigma
+    target = Decimal(0)
+    assert stop < entry < target
+    assert RESIDUAL_BASIS != "price"
+
+
+def test_the_residual_refuses_degenerate_inputs_rather_than_publishing_a_sign():
+    """A zero-length or mismatched window must raise, not silently produce a residual whose sign
+    decides a trade direction."""
+    import numpy as np
+
+    from core.errors import StrategyError
+    from strategy.c1c_relative import residual_from_windows
+
+    with pytest.raises(StrategyError, match="leg lengths differ"):
+        residual_from_windows(np.array([1.0, 2.0, 3.0]), np.array([1.0, 2.0]), 1.0)
+    with pytest.raises(StrategyError, match="at least two bars"):
+        residual_from_windows(np.array([1.0]), np.array([1.0]), 1.0)

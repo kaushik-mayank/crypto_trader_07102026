@@ -1077,6 +1077,12 @@ against a fresh holdout; API-change drill.
 | **D-51** | Ignore rules for the holdout are **anchored to the repository root** (`/data/`, not `data/`) | A bare `data/` matches a directory of that name at any depth, and silently excluded `frontend/app/data/` — so the commit that added the Data page added everything except it, through four stages that each reported success (F-057). The holdout is still covered, because it only ever lived at the root. A test now runs `git check-ignore` over every deployable file, because the next person to add a route called `data`, `logs`, `build` or `dist` will not be thinking about `.gitignore` |
 | **D-52** | Each side of the deployment must be able to **state its own version**, and one must check the other's | Two sessions were spent debugging a VM that was working correctly, because every diagnostic asked "is the engine healthy" and none asked "is the engine the version the dashboard expects" (F-059). `diagnose.sh` §4b probes the routes the dashboard calls and §4c prints the running commit; `update.sh` refuses to let "already up to date" read as success. More careful deployment instructions were not the answer — the drift is the default state of a two-sided deployment, so it has to be observable rather than avoided |
 | **D-53** | A display rule that depends on a **new** engine field also reads the old payload's evidence | The dashboard and the engine deploy separately, so a fix that needs both halves simultaneously is wrong for the entire window anyone is watching it — and stays wrong afterwards for every pre-upgrade row still in the signals table. `priceBasis()` prefers `price_basis` and falls back to `two_leg` / `levels_are`; `directionPending()` prefers `pending_direction` and falls back to `pending` / `entry_triggers` (F-058). The fallbacks are the case that actually occurs, not padding |
+| **D-54** | Model filters key on the persisted `signals.strategy_class`; the API publishes the labels | The classification is written by each strategy and stored on every row, so a filter that re-derived it from a strategy id or a display string would be a second source of truth to keep in step. The API publishes `STRATEGY_CLASSES` with the canonical `specs/03`-`specs/06` titles, and the dashboard renders what it is given — the frontend's fallback list exists only for an engine too old to publish them (D-53's reasoning applied again) |
+| **D-55** | Date grouping and display are both **UTC**, and the UI labels the zone | Bars are UTC-aligned (F-012) and every stored timestamp is epoch milliseconds. Grouping by the viewer's local day would move the boundary per reader, so a suggestion issued at 23:30 UTC would sit under different dates for two people and "look at the 10th" would stop being a shareable statement. Ranges are **half-open** `[start, start+86400000)`, so a suggestion at exactly midnight is counted once |
+| **D-56** | A restart **re-evaluates** persisted setups rather than trusting them, and refuses six cases by name | specs/13 §11.1. Resuming a setup armed under a different `parameter_hash` or without its stored `context` would produce a plausible suggestion computed from two rule sets or from facts that were thrown away — worse than not resuming, because it looks like it worked. A refused setup is **not transitioned**: inventing a terminal state for a setup the process never observed would rewrite history it did not witness (F-062) |
+| **D-57** | Analytics publishes **five** rates, each with its numerator, denominator and a prose definition; a zero denominator is `None` | "The hit rate" has two legitimate readings that differ by a lot — 3 of 5 resolved is 60%, 3 of 12 issued is 25% — so neither is called "the" rate and both are shown. The fraction travels with every figure so any number can be checked against a direct query. `0.0` on an empty sample would read as "nothing ever hit", a claim about the market; `None` is a claim about the sample and is the true one (F-064) |
+| **D-58** | The five terminal states that are **not** a trade result are counted in their own bucket, never folded into a rate's denominator and never dropped | `specs/07` §8 has seven terminal states and only `TARGET_HIT`/`STOPPED` are a trade result. On the verification fixture the other five are *more than half* the suggestions. In the denominator they understate every strategy; dropped, they hide the operationally important cases — everything being `SUPPRESSED` by arbitration, or `MISSED` during an outage. The page shows the buckets summing to the total so none can be lost silently (F-064) |
+| **D-59** | Analytics aggregates in SQL over a bounded window and the page does not poll | Four `GROUP BY` queries over an index range, ≤ 6 SELECTs per page (asserted through sqlite's trace callback), window capped at 366 days. Counts over whole days change when a suggestion resolves, not every fifteen seconds, so a timer would spend the VM's cycles redrawing identical numbers — and aggregating in the browser would also move the UTC day boundary into the viewer's timezone |
 | **D-16** | Every ruff ignore carries an inline reason | The ignores are deliberate patterns (long-lived recorder handles, pairwise `zip`, `Kind(str, Enum)`), not unfixed warnings. An unexplained ignore is indistinguishable from neglect |
 
 ---
@@ -1365,6 +1371,238 @@ date", and restarting the same code. I gave that instruction twice without check
 other's version, so every symptom of the drift looks like a configuration problem on whichever side
 is being looked at. The answer is not more careful instructions — it is each side being able to
 state its own version, and one of them checking the other's.
+
+
+### PHASE-33 — Health interpretation and C1-C verification (2026-10-11) — **Phase 1 of 4 complete**
+
+Multi-phase task: health/C1-C diagnosis (1), model filters + timestamps + history + outcome updates
+(2), an Analytics page (3), integration and docs (4). **Phase 1 only** in this entry; phases 2–4
+are not started. The canonical model names found during Phase Zero are recorded below because every
+later phase depends on them.
+
+#### The four strategy classes — canonical names (from `specs/03`–`specs/06`)
+
+| Class | Canonical spec title | Mechanism | Strategies | DB column |
+|---|---|---|---|---|
+| 1 | **Correction & Rebalancing** | restoring force — fade dislocations | C1-A, C1-B, C1-C | `signals.strategy_class = 1` |
+| 2 | **Trend Persistence & Risk-Normalized Participation** | risk-adjusted drift — participate | C2-A, C2-B, C2-C | `= 2` |
+| 3 | **Anticipatory Transition** | state change — anticipate, risk quantified | C3-A, C3-B, C3-C | `= 3` |
+| 4 | **Established Methodologies & the Benchmark Suite** | external evidence — published, independently documented edges, and the benchmark controls | C4-A, C4-B, C4-C (+ controls X1, X2) | `= 4` |
+
+Class 4 is the one the request called "external evidence"; its authoritative name is **Established
+Methodologies & the Benchmark Suite** (`specs/06`). The classification is **already persisted** as
+`signals.strategy_class`, written from `raw.detail["strategy_class"]`, so filters must key on that
+column and never on display text.
+
+#### Phase 1 changes
+
+| Path | Change |
+|---|---|
+| `src/core/health.py` | `operational_status`, `faults()`, `modelling_components`, `modelling_findings`; `degraded_reasons` is faults-only; `to_dict()` publishes `operational_status`, `fault_count`, `modelling_findings` (F-060) |
+| `src/api/services.py` | The envelope carries `operational_status` and `modelling_findings`, so the finding travels with every response; `HealthService.health()` no longer overrides it with the overall status |
+| `src/api/render.py` | A distinct "REDUCED SELECTIVITY" notice, styled apart from the fault banners |
+| `frontend/components/Panels.tsx` | `HealthPanel` counts faults over operational components and gives findings their own panel, naming the asset and the failing test |
+| `frontend/app/globals.css` | `.card.model-finding` |
+| `tests/` | 15 tests: health separation (4), the endpoint and both dashboards (6), C1-C's sign convention (5) |
+| `docs/findings.md` | **F-060**, **F-061** |
+
+**No schema change, no threshold change, no model change.** The regime classifier still reports
+`DEGRADED` for a degraded model and a test asserts it does.
+
+#### Phase 2–4 investigation already banked (do not redo)
+
+* **Timestamps.** `signals.created_at_ms` is the wall-clock write time, is **not** in the
+  `ON CONFLICT DO UPDATE SET` list, and is therefore already the stable suggestion-generation
+  timestamp. `as_of_ms` is the market-data/evaluation time; `state_since_ms` updates on transition.
+  No new column is needed for Phase 2B. Defects found: `_write_signal` inserts `expires_at_ms=None`
+  and `original_entry_price=None`, and sets `armed_at_ms = as_of_ms` rather than the setup's own
+  arming time.
+* **Outcome evaluation already exists.** `strategy/lifecycle.py:_manage_triggered` checks stop and
+  T1 against the current price and transitions to `STOPPED` / `TARGET_HIT`; `Lifecycle` already has
+  both as terminal states. **Reuse it; do not build a second evaluator.**
+* **The Phase 2D defect is a wiring gap.** `AuditTrail.open_setups()` exists, is documented "for a
+  restart to resume from (specs/13 §11.1)", and **has no callers**. `AppRunner.states` starts as
+  an empty dict every process start, so every restart abandons every armed setup: those rows stay
+  `SETUP_DETECTED`/`ENTER_NOW`/`TRIGGERED` in the `signals` table forever and can never reach
+  `TARGET_HIT`, `STOPPED` or `EXPIRED`. `setup_state` **is** written (`audit/trail.py`), so the
+  persistence half is present and only the resume half is missing. specs/13 §11.1 requires
+  re-evaluating each persisted setup against the current snapshot — re-arm with the original
+  `armed_at_ms`, `INVALIDATED` if conditions no longer hold, `EXPIRED` if past expiry — and
+  §11.2 requires a trigger that fired during an outage to be `MISSED_OUTAGE`, never `TRIGGERED`.
+  This is the third instance of the "implemented, never called" pattern after F-043 and F-054.
+* **Indexes.** `idx_signals_created (created_at_ms, signal_id)` already supports date-scoped
+  history pagination. There is no index on `strategy_class`.
+* **Local database has zero signals**, so Phase 2–3 verification must use controlled fixtures
+  rather than live data — which the task prefers anyway.
+
+
+### PHASE-34 — Model filters, suggestion history and restart resume (2026-10-11) — **Phase 2 of 4: A–D complete, E blocked**
+
+Phase 2A (model filters), 2B (timestamps), 2C (live vs history) and 2D (historical outcome updates)
+are implemented and verified. **2E is deliberately not applied** — see F-063 and §Decisions needed.
+
+#### Schema change: migration 3 (the only one in this task)
+
+```sql
+ALTER TABLE setup_state ADD COLUMN context TEXT;          -- additive, nullable, no backfill
+ALTER TABLE setup_state ADD COLUMN triggered_at_ms INTEGER;
+CREATE INDEX idx_setup_state_lifecycle ON setup_state (lifecycle, armed_at_ms);
+CREATE INDEX idx_signals_class_created ON signals (strategy_class, created_at_ms);
+```
+
+Applied to the 6.2 GB development database in **0.01 s**, 21.9 M bars intact; separately verified to
+upgrade a populated v2 database without touching its rows, and to be idempotent on re-open.
+`python -m ingest` opens the store with `migrate=True` and runs **before** `app --check` in
+`update.sh`, so the deploy path applies it — an ordering the deployment now depends on.
+
+#### Changes
+
+| Path | Change |
+|---|---|
+| `src/app/resume.py` | **New** — rehydrate persisted setups on startup per specs/13 §11.1, with six named refusals and a report. Pure core (`resume_setups`) takes rows and facts and returns states, so every refusal is testable without a database (F-062) |
+| `src/app/__main__.py` | Calls `resume_into` **before the first evaluation** — the caller that was missing |
+| `src/audit/trail.py` | `_write_setup_state` persists `context` and `triggered_at_ms`; without them the table could not support the resume it was built for |
+| `src/store/migrations.py` | Migration 3 |
+| `src/store/sqlite_store.py` | `_statements()` — the applier split on `sql.split(";")`, so a semicolon inside a `--` comment cut a statement in half |
+| `src/api/services.py` | `STRATEGY_CLASSES` (canonical spec titles), `day_bounds` (half-open UTC), validated `_strategy_class` / `_lifecycle_state`; `live(strategy_class=…)`; `history(day, strategy_class, state, asset)` filtered **in SQL**; new `days()` aggregate; `_group_by_model` |
+| `src/api/app.py` | `/api/signals/days`; `history` takes the filters; the live cache key now carries every parameter that changes the result; the cache copies `modelling_findings` |
+| `frontend/components/Suggestions.tsx` | **New** — `ModelFilter`, `DayPicker`, `StatusFilter`, `HistoryRow`, `utcStamp`, `modelList`. Reuses the existing `.seg`/`.card`/`.row` classes |
+| `frontend/app/page.tsx` | Live/History switch, model + status filters, date strip, paged history. The live poll stops when History is open; the day index is not polled |
+| `frontend/lib/api.ts` | `liveSignalsFiltered`, `signalDays`, `signalHistory` |
+| `frontend/app/globals.css` | `.day-strip`, `.outcome-*`, `.select`, `.chip-count` |
+| `tests/test_resume.py` | **New** — 16 tests, weighted to the refusals |
+| `tests/test_api_suggestions.py` | **New** — 21 tests on a controlled 8-row fixture, every count hand-computed |
+| `tests/test_frontend_contract.py` | +9 on the filters, UTC stamps, paging and poll discipline |
+| `tests/test_store.py` | The schema-version assertion derives from `MIGRATIONS` instead of hard-coding `[1, 2]` |
+| `docs/findings.md` | **F-062**, **F-063** |
+
+#### Timestamp semantics (2B) — no new column was needed
+
+| Column | Means | Moves? |
+|---|---|---|
+| `created_at_ms` | **when the suggestion was issued** | no — absent from the `DO UPDATE SET` list |
+| `as_of_ms` | the market data the evaluation ran on | on each republish |
+| `state_since_ms` | when the lifecycle last changed | on each transition |
+
+History orders and filters on `created_at_ms`, so an outcome recorded today does not move a
+suggestion from yesterday into today. A test asserts the SQL keeps it out of the update list, and
+another asserts the issue time is byte-identical after a state change.
+
+**Day boundaries are UTC and the UI says so.** Every bar is UTC-aligned (F-012) and `findings.md`
+dates everything in UTC; grouping by a local day while storing UTC would move the boundary with the
+viewer, so "look at the 10th" would mean different sets of suggestions to two people.
+
+#### Efficiency (measured, not asserted)
+
+`EXPLAIN QUERY PLAN` on all five new queries — none scans the signals table:
+
+| Query | Plan |
+|---|---|
+| history by day | `SEARCH … USING INDEX idx_signals_created` |
+| history by day + model | `SEARCH … USING INDEX idx_signals_class_created` |
+| history by model | `SEARCH … USING INDEX idx_signals_class_created` |
+| day index | `SCAN … USING COVERING INDEX` (never touches the table) |
+| resume | `SEARCH setup_state USING INDEX idx_setup_state_lifecycle` |
+
+#### Decisions needed before 2E
+
+**F-063.** `signals.created_at_ms` is `NOT NULL`, has been since the table was created, and holds a
+real issue time for every row (0 rows with NULL or 0). The requested 10 Oct 23:11 legacy stamp would
+therefore **overwrite accurate data with a fabricated constant**, which four of the task's own
+constraints forbid. Three options are written out in F-063; option 2 (a non-destructive, labelled
+`legacy_display_ms` column scoped by a recorded cutoff) is the one the request itself points at and
+is what will be built on confirmation. The development database has **zero** signals, so the only
+affected rows are on the VM.
+
+#### Not started
+
+Phase 3 (Analytics page) and Phase 4 (integration, regression, docs). The Phase 3 denominators are
+the part to get right: "share of all suggestions that hit a target" and "target-hit rate among
+*resolved* suggestions" are different numbers, and the lifecycle has seven terminal states, not two
+— `EXPIRED`, `INVALIDATED`, `SUPPRESSED`, `MISSED` and `HANDED_OFF` are resolutions that are neither
+a hit nor a stop, and a rate that buries them in the denominator understates both.
+
+
+### PHASE-35 — The Analytics page, and Phase 4 integration (2026-10-11) — **Phases 3 and 4 complete**
+
+Fourth page, integration-tested, documented. The task's four phases are now 1 ✅, 2 ✅ (A–D; **E
+awaiting a decision**, F-063), 3 ✅, 4 ✅.
+
+#### Changes
+
+| Path | Change |
+|---|---|
+| `src/api/services.py` | `AnalyticsService` — `overview()` plus the state buckets (`OPEN_STATES`, `RESOLVED_STATES`, `CLOSED_WITHOUT_RESULT`, `TRIGGERED_STATES`), five rates each carrying its own numerator, denominator and definition, four SQL breakdowns, a generated `limitations` list. `build_analytics()` is separate from `build_services()` so the existing three-tuple contract is untouched |
+| `src/api/app.py` | `GET /api/analytics`; `analytics=` is an **optional** keyword, so every existing `create_app()` call still works, and a missing dependency answers an honest 503 naming the wiring rather than a 404 |
+| `src/app/__main__.py` | Builds and passes the analytics service |
+| `frontend/app/analytics/page.tsx` | **New** — window / model / asset filters, counts, five rates with their fractions visible, model / asset / day breakdowns, and the limitations rendered **above** the figures |
+| `frontend/components/Nav.tsx`, `lib/api.ts`, `app/globals.css`, proxy allow-list | The fourth page wired in; `.metric*` styles |
+| `tests/test_analytics.py` | **New** — 32 tests, every figure cross-checked against a direct `COUNT(*)` |
+| `tests/test_frontend_contract.py` | +8 on the analytics page |
+| `docs/findings.md` | **F-064** |
+
+#### Metric definitions (the part that had to be got right)
+
+`specs/07` §8 has eleven states, seven terminal, and **only two are a trade result**. On the
+verification fixture the five terminal states that are *not* a result are five of twelve
+suggestions — more than the two that resolved. Putting them in the denominator understates every
+rate; dropping them hides most of what the system did. So each is counted and named, and the page
+shows the buckets summing to the total.
+
+| Rate | Fixture | Question it answers |
+|---|---|---|
+| `target_hit_of_resolved` | 3/5 = **60%** | of suggestions that reached a trade result, how many worked |
+| `target_hit_of_all` | 3/12 = **25%** | of everything issued, how much worked |
+| `resolved_of_all` | 5/12 = 42% | how much of the output is measurable at all |
+| `triggered_of_all` | 6/12 = 50% | how often a hypothetical entry occurred |
+
+A zero denominator gives **`None`, never `0.0`**. `INVALIDATED` is excluded from the triggered count
+because it is reachable both before and after a trigger. See F-064.
+
+#### Phase 4 — integration and regression
+
+**907 tests pass**; ruff and mypy clean on 135 source files. Up from 806 at the start of this task
+(+101). No test was weakened or skipped.
+
+Full HTTP surface exercised against a fixture, as the deployed engine serves it:
+
+| Route | Status | Observed |
+|---|---|---|
+| `/api/health` | 200 | `envelope=HEALTHY faults=0 findings=1` — the F-060 fix in action |
+| `/api/signals/live`, `?strategy_class=2` | 200 | 1 and 1 |
+| `/api/signals/days` | 200 | 1 day |
+| `/api/signals/history?day=…` | 200 | 3 |
+| `/api/analytics` | 200 | `all=3 resolved=2 win=0.5` |
+| `/api/sources`, `/api/candles/…`, `/api/regime`, `/` | 200 | |
+
+Four malformed inputs (inverted range, class 9, `day=bad`, `timeframe=2h`) all answer **400** with
+`problem_class: configuration` and the allowed set named — never an empty page that reads as a quiet
+day.
+
+**Query efficiency, measured.** `EXPLAIN QUERY PLAN` on all eight new queries: every one uses an
+index, none scans `signals`, and the day index is a covering-index scan. One analytics page issues
+**≤ 6** SELECTs, asserted through sqlite's trace callback rather than claimed.
+
+**Regression surface checked.** `create_app`'s new parameter and `build_analytics` are additive, so
+no existing call site changed. The live cache key now carries every parameter that varies the result
+— without that, one model's suggestions would have been served under another's heading for the
+cache's lifetime, a wrong answer rather than a stale one. The cache also now copies
+`modelling_findings`, which it would otherwise have dropped for two seconds at a time.
+
+#### Known limitations, carried forward
+
+* **Phase 2E is not applied.** `created_at_ms` is `NOT NULL` with a real value on every row, so the
+  requested legacy stamp would overwrite good data. Three options are written out in F-063; the
+  non-destructive one needs a word from the owner.
+* **Node is not installed here**, so the TypeScript cannot be compiled or executed. The 60-odd
+  contract tests read it as text — they catch an accessor or a threshold diverging from the Python,
+  not a type error. **The first Vercel build is still the compiler.**
+* **The local database holds zero signals**, so every Phase 2–3 figure is verified against
+  controlled fixtures rather than live data. The fixtures are the stronger check for deterministic
+  rules, but they cannot catch a disagreement between the fixture's shape and what the engine
+  actually writes — which is what F-056 was.
+* **The analytics numbers are not performance evidence.** Nothing is validated, outcomes are
+  hypothetical and uncosted, and the engine says so on the page.
 
 
 ## Next Action
