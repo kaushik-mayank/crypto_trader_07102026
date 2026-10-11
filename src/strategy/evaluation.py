@@ -184,6 +184,13 @@ def build_signal(*, strategy: Any, features: FeatureSet, snapshot: MarketSnapsho
         regime=regime.to_dict(),
         detail={**(priced.detail or {}), **(detail or {}),
                 "tier": strategy.tier,
+                # **The classification, from the strategy's own declaration.** It was missing here,
+                # and `audit/trail.py:_write_signal` reads `raw.detail["strategy_class"]` with a
+                # default of 0 — so every C1, C2 and C3 signal was persisted as class **0** while
+                # the C4 strategies, which happen to pass it in their own `detail=`, were persisted
+                # correctly. The dashboard's model filter keys on that column, so three of the four
+                # filters matched nothing and their counts read zero (F-065).
+                "strategy_class": int(strategy.strategy_class),
                 "price_basis": priced.price_basis,
                 "validated": False,          # nothing is validated until Phase 16 says so
                 "expansion_seeking": strategy.expansion_seeking},

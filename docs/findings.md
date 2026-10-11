@@ -2228,6 +2228,114 @@ tracks a trade nobody was required to take — and no cost or slippage is deduct
 sample is small rather than because someone remembered to write it down, and the page renders it
 **above** the figures rather than in a footnote. A number on a dashboard acquires authority the
 number itself has not earned.
+
+---
+
+## F-065 — Three of the four model filters matched nothing, because the class was never written ✅
+
+**Date:** 2026-10-11 · **Problem class:** application_bug · **Fixed**
+
+Reported symptom, and it is a good one because it is *arithmetically impossible* on its face:
+
+```
+model:  All   Correction 0   Persistence 0   Transition 0   Established 13
+```
+
+...above a list showing more than thirteen suggestions. The chips could not be reconciled against
+the list, which is the sort of discrepancy that means one of the two numbers is lying.
+
+### The cause: a default that looks like a value
+
+`audit/trail.py:_write_signal` read the classification out of the signal's payload:
+
+```python
+strategy_class = int(raw.detail.get("strategy_class", 0) or 0)
+```
+
+and `strategy/evaluation.py:build_signal` **never put it there.** It published `tier`,
+`price_basis`, `validated` and `expansion_seeking`, and not the class.
+
+So the column was written `0` for every signal — *except* for the C4 strategies, which happen to
+pass `"strategy_class": 4` in their own `detail=` kwarg (six call sites in `c4_established.py`).
+Hence exactly the reported screen: class 4 correct, classes 1–3 stored as 0.
+
+`signals.strategy_class` is what the dashboard's model filter keys on (`WHERE strategy_class = ?`),
+so three of the four filters matched **nothing**, their counts read **zero**, and the suggestions
+they should have matched were counted under a `"0"` key that the frontend never rendered.
+
+**Nothing raised, at any layer.** The column is `NOT NULL` and `0` satisfies it; the filter returned
+an empty set, which is a legitimate answer; the chip showed a legitimate count. A default that is a
+*valid-looking value* for a column other code filters on is a bug with no symptom at the point it
+happens — it surfaces somewhere else, as arithmetic that does not add up.
+
+### Three fixes, because it needed three
+
+1. **`build_signal` publishes `int(strategy.strategy_class)`** — the strategy object's own
+   declaration, which is the authority. Every new signal is now classified correctly.
+2. **The writer falls back to the registry, not to zero.** `strategy_class_of()` in
+   `strategy/registry.py` is the single implementation: it prefers the registered strategy's
+   declared class and falls back to the `C<n>-` prefix for an id this build no longer registers.
+   Only a genuinely unrecognisable id stores `0`, and that logs `signal_class_unknown` with a
+   remediation.
+3. **Migration 4 repairs the rows already written.** A repair, not a reinterpretation: the correct
+   value is derivable with certainty from the `strategy_id` in the same row, using the same mapping
+   the registry has always had. It introduces no new rule and changes no outcome, status, price or
+   timestamp — one column, scoped to rows whose class is not already 1–4 *and* whose id matches
+   `C[1-4]-*`. A row matching neither is left exactly as it is rather than guessed at.
+
+Verified on a fixture reproducing the bug exactly: `C1-B`, `C2-A`, `C3-C` stored as 0 become 1, 2, 3;
+a `C4-B` already at 4 is untouched; a `LEGACY-X` row stays at 0; states and `created_at_ms` are
+unchanged on all five; re-running is idempotent. Applied to the development database in 0.003 s.
+
+### The display half, which is why it was unexplainable
+
+The engine's `_group_by_model` *did* count the orphans, under a `"0"` key. The frontend's
+`modelList()` iterated only the four published models, so that bucket was silently dropped — the
+count existed in the payload and appeared nowhere on screen.
+
+Both ends now surface it: an unclassified bucket renders as its own chip, and the page prints a red
+line saying the counts will not add up to the list and that the VM probably needs updating. **A
+count that appears nowhere cannot be reconciled**, and the reader was left to discover the
+discrepancy by adding up the chips themselves.
+
+### What let it ship
+
+Every existing test inserted signals **by hand with an explicit `strategy_class`**, so none of them
+exercised the write path that was defaulting it. The new
+`test_a_signal_written_through_the_audit_trail_carries_its_real_class` goes through the real
+`_write_signal` with no class in the detail — the exact shape the bug produced — and asserts all
+four land correctly.
+
+---
+
+## F-066 — The live suggestions showed no issue time; the history view did ✅
+
+**Date:** 2026-10-11 · **Problem class:** application_bug (omission) · **Fixed**
+
+`HistoryRow` displayed `created_at_ms` as "issued". `SignalCard` — the live card — displayed no
+timestamp at all.
+
+So the **most time-sensitive view was the only one that could not answer "how old is this?"** And
+being on screen says nothing about age here: a setup at an hourly horizon legitimately stays live
+for hours by design, which is the whole point of F-052's separation of market-data age from
+suggestion age.
+
+Nothing was missing from the data. `created_at_ms` has been written since the `signals` table was
+created and is deliberately excluded from `_write_signal`'s `ON CONFLICT DO UPDATE SET` list, so it
+is stable (F-063 established this while investigating the legacy-date request). **The value was
+there the whole time and the live card simply never rendered it** — so every existing suggestion
+displays its true creation time the moment the dashboard is redeployed, with no waiting for new
+signals.
+
+The card now shows two timestamps when they differ, because they answer different questions:
+
+| Shown as | Column | Means |
+|---|---|---|
+| suggested | `created_at_ms` | when it was first issued — never moves |
+| state changed | `state_since_ms` | when the lifecycle last moved (detected → armed → triggered) |
+
+One number for both would make a setup detected yesterday and triggered an hour ago read as an
+hour-old suggestion. Rendered in UTC with the zone named, matching the date grouping (D-55).
 ## Open questions
 
 

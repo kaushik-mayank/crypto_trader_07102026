@@ -367,3 +367,154 @@ def test_every_new_query_uses_an_index(seeded):
         assert "USING INDEX" in detail or "USING COVERING INDEX" in detail, \
             f"{label} does not use an index: {detail}"
         assert "SCAN signals" not in detail, f"{label} scans the signals table: {detail}"
+
+
+# ---- the classification was being written as 0 for three of the four models (F-065) ---------
+
+def test_build_signal_publishes_the_strategys_declared_class():
+    """The defect's origin. `_write_signal` reads `raw.detail["strategy_class"]` with a default of
+    **0**, and `build_signal` never published it — so only the C4 strategies, which pass it in their
+    own `detail=` kwarg, were persisted correctly. Everything else was stored as class 0, three of
+    the four model filters matched nothing, and their counts read zero while the total did not."""
+    import inspect
+
+    from strategy.evaluation import build_signal
+
+    source = inspect.getsource(build_signal)
+    assert '"strategy_class": int(strategy.strategy_class)' in source, (
+        "the class must come from the strategy's own declaration, which is the authority"
+    )
+
+
+def test_the_writer_falls_back_to_the_registry_rather_than_to_zero():
+    """A default that is a *valid-looking value* for a column other code filters on is a bug with no
+    symptom where it happens. The fallback is the registry; only a genuinely unknown strategy id
+    stores 0, and that logs a warning."""
+    import inspect
+
+    from audit.trail import AuditTrail
+
+    source = inspect.getsource(AuditTrail._write_signal)
+    assert "strategy_class_of(raw.strategy_id)" in source
+    assert "signal_class_unknown" in source, "an unclassifiable signal must say so"
+
+
+def test_the_classification_helper_agrees_with_every_registered_strategy():
+    """One implementation, checked against all fourteen. A second derivation would be a second thing
+    to keep in step with the persisted column."""
+    from strategy.registry import backtest_strategies, strategy_class_of
+
+    for strategy in backtest_strategies({}):
+        assert strategy_class_of(strategy.id) == strategy.strategy_class, strategy.id
+    # An id this build does not register still classifies from its prefix, for the repair migration.
+    assert strategy_class_of("C2-Z") == 2
+    # And something genuinely unrecognisable is 0 rather than a guess.
+    assert strategy_class_of("LEGACY-X") == 0
+    assert strategy_class_of("") == 0
+
+
+def test_a_signal_written_through_the_audit_trail_carries_its_real_class(tmp_path):
+    """End to end through the writer: a C2 signal must land in the database as class 2, not 0.
+
+    This is the test whose absence let the defect ship. Every existing test asserted on signals
+    inserted by hand with an explicit class, so none of them exercised the write path that was
+    defaulting it.
+    """
+    from decimal import Decimal
+
+    from audit.trail import AuditTrail
+    from normalize.canonical import Product, Timeframe
+    from strategy.act import Direction
+    from strategy.base import Lifecycle, RawSignal
+
+    store = open_store(tmp_path / "cls.db")
+    try:
+        trail = AuditTrail(store=store)
+
+        class FakeSizing:
+            def to_dict(self):
+                return {}
+
+        class FakeSignal:
+            def __init__(self, raw):
+                self.raw = raw
+                self.detail = {}
+                self.vetoes = []
+                self.sizing = FakeSizing()
+
+            def to_dict(self):
+                return {"raw": {}}
+
+        for strategy_id in ("C1-B", "C2-A", "C3-C", "C4-B"):
+            raw = RawSignal(
+                signal_id=f"sig-{strategy_id}", strategy_id=strategy_id, strategy_version="1.0.0",
+                asset="B-BTC_USDT", product=Product.FUTURES, direction=Direction.LONG,
+                lifecycle=Lifecycle.SETUP_DETECTED, as_of_ms=D1,
+                signal_timeframe=Timeframe.H1, entry=Decimal("100"),
+                stop=Decimal("95"), targets=(Decimal("110"),),
+                # Deliberately *no* strategy_class in detail: this is the shape the bug produced.
+                detail={"tier": "A", "validated": False})
+            trail._write_signal(FakeSignal(raw), None, D1, D1)
+        store.conn.commit()
+
+        stored = {r["strategy_id"]: r["strategy_class"] for r in store.conn.execute(
+            "SELECT strategy_id, strategy_class FROM signals")}
+        assert stored == {"C1-B": 1, "C2-A": 2, "C3-C": 3, "C4-B": 4}, stored
+    finally:
+        store.close()
+
+
+def test_the_repair_migration_fixes_only_the_rows_it_should(tmp_path):
+    """Migration 4. A repair, not a reinterpretation: the correct value is derivable with certainty
+    from the `strategy_id` in the same row, using the mapping the registry has always had.
+
+    Hand-checked: C1/C2/C3 rows stored as 0 are corrected, a C4 row already at 4 is untouched, and a
+    row whose id matches no pattern is **left at 0 rather than guessed at**.
+    """
+    store = open_store(tmp_path / "rep.db")
+    try:
+        for sid, strategy, klass in (("a", "C1-B", 0), ("b", "C2-A", 0), ("c", "C3-C", 0),
+                                      ("d", "C4-B", 4), ("e", "LEGACY-X", 0)):
+            store.conn.execute(
+                """INSERT INTO signals (signal_id, strategy_id, strategy_version, strategy_class,
+                       asset, product, direction, state, state_since_ms, tier, validated, mode,
+                       armed_at_ms, parameter_hash, code_version, snapshot_id, as_of_ms, payload,
+                       created_at_ms, updated_at_ms)
+                   VALUES (?,?,'1.0.0',?,'B-BTC_USDT','futures','LONG','TARGET_HIT',1,'A',0,
+                           'suggestion',1,'ph','cv','s',1,'{}',1,1)""", (sid, strategy, klass))
+        store.conn.commit()
+
+        # The migration is part of the schema, so re-running it is how it is applied on deploy.
+        from store.migrations import MIGRATIONS
+
+        repair = [sql for v, _, sql in MIGRATIONS if v == 4][0]
+        from store.sqlite_store import _statements
+
+        for statement in _statements(repair):
+            store.conn.execute(statement)
+        store.conn.commit()
+
+        got = {r["strategy_id"]: r["strategy_class"] for r in store.conn.execute(
+            "SELECT strategy_id, strategy_class FROM signals")}
+        assert got == {"C1-B": 1, "C2-A": 2, "C3-C": 3, "C4-B": 4, "LEGACY-X": 0}
+        # Nothing else moved: the repair touches one column.
+        assert store.conn.execute(
+            "SELECT COUNT(*) FROM signals WHERE created_at_ms = 1 AND state = 'TARGET_HIT'"
+        ).fetchone()[0] == 5
+    finally:
+        store.close()
+
+
+def test_a_class_outside_the_four_is_counted_and_not_silently_dropped(seeded):
+    """The count that made the defect unexplainable from the screen. The engine must report an
+    unclassified bucket so the chips can be reconciled against the list; it must not vanish."""
+    seeded.conn.execute("UPDATE signals SET strategy_class = 0 WHERE signal_id = 'b1'")
+    seeded.conn.commit()
+    signals, _, _ = build_services(seeded)
+    by_model = signals.live().payload["by_model"]
+    assert "0" in by_model, "an unclassified bucket must appear in the payload"
+    assert by_model["0"]["count"] == 1
+    assert "not one of the four" in by_model["0"]["summary"]
+    # And the four known classes still add up with it to the displayed total.
+    total = sum(v["count"] for v in by_model.values())
+    assert total == signals.live().payload["count"]

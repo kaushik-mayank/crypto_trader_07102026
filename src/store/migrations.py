@@ -226,6 +226,33 @@ MIGRATIONS: list[tuple[int, str, str]] = [
         CREATE INDEX idx_signals_class_created ON signals (strategy_class, created_at_ms);
         """,
     ),
+    (
+        4,
+        "repair strategy_class on signals written with the missing-class default (F-065)",
+        """
+        -- A **repair**, not a reinterpretation, and the distinction matters.
+        --
+        -- `build_signal` never published `strategy_class`, and `_write_signal` read it from the
+        -- payload with a default of 0. The C4 strategies pass it in their own detail dict, so C4
+        -- signals were stored correctly and every C1, C2 and C3 signal was stored as **0**. The
+        -- dashboard filters on that column, so three of the four model filters matched nothing and
+        -- their counts read zero while the total did not.
+        --
+        -- The correct value is not a judgement: it is derivable with certainty from the
+        -- `strategy_id` already in the same row, using the same `C<n>-` mapping the registry has
+        -- always had. So this restores a value that was always determined and was written wrong,
+        -- which is why it is safe to apply to historical rows. It introduces no new rule and
+        -- changes no outcome, status, price or timestamp.
+        --
+        -- Scoped twice over: only rows whose class is not already one of the four, and only where
+        -- the id matches the pattern. A row that matches neither is left exactly as it is rather
+        -- than guessed at, and will still report as unclassified where the dashboard now shows it.
+        UPDATE signals
+           SET strategy_class = CAST(SUBSTR(strategy_id, 2, 1) AS INTEGER)
+         WHERE strategy_class NOT IN (1, 2, 3, 4)
+           AND strategy_id GLOB 'C[1-4]-*';
+        """,
+    ),
 ]
 
 

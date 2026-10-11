@@ -7,6 +7,7 @@
  * small on purpose: all the judgement lives in `lib/honesty.ts` and in the engine's own payload, so
  * these are renderers, not deciders.
  */
+import { utcStamp } from '@/components/Suggestions';
 import { ageState, ageText, concentrationNotice, confidenceCopy, directionPending, displayable, priceBasis, signalDetail, validationNotice, type PanelState } from '@/lib/honesty';
 
 /** Age, always as text and colour together — never colour alone. */
@@ -154,8 +155,36 @@ export function SignalCard({ signal }: { signal: Signal }) {
           <strong className={dir === 'LONG' ? 'long' : 'short'}>{dir}</strong>
         )}
         <span className="mono">{signal.strategy_id}</span>
-        <span className="age age-ok">{String(signal.lifecycle ?? '')}</span>
+        <span className="age age-ok">{String(signal.lifecycle ?? signal.state ?? '')}</span>
         {!isPrice && <span className="age age-amber">{basis} units — not a price</span>}
+      </div>
+
+      {/* **When this suggestion was first issued.** The history view showed it and the live cards
+          did not, which left the most time-sensitive view as the one that could not answer "how old
+          is this?" — and a setup at an hourly horizon legitimately stays live for hours, so the
+          answer is never obvious from the fact that it is on screen (F-066).
+
+          `created_at_ms` is the issue time and never moves. `state_since_ms` is when the lifecycle
+          last changed, which for a live setup is when it was detected, armed or triggered — a
+          different and also useful number, so both are shown when they differ. */}
+      <div className="row" style={{ marginTop: 8 }}>
+        <span>
+          <span className="label">suggested</span>
+          <span className="mono">{utcStamp(signal.created_at_ms)}</span>
+          {typeof signal.created_at_ms === 'number' && (
+            <span className="age age-ok" style={{ marginLeft: 8 }}>
+              {ageText((Date.now() - signal.created_at_ms) / 1000)}
+            </span>
+          )}
+        </span>
+        {typeof signal.state_since_ms === 'number' &&
+          typeof signal.created_at_ms === 'number' &&
+          signal.state_since_ms > signal.created_at_ms + 60_000 && (
+            <span>
+              <span className="label">state changed</span>
+              <span className="mono">{utcStamp(signal.state_since_ms)}</span>
+            </span>
+          )}
       </div>
 
       {pendingDirection && (

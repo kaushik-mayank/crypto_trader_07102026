@@ -26,6 +26,7 @@ from core.errors import AuditError
 from core.logging import get_logger
 from risk.engine import Signal
 from strategy.base import SetupState, StrategyOutcome
+from strategy.registry import strategy_class_of
 
 log = get_logger("audit.trail")
 COMPONENT = "audit.trail"
@@ -95,7 +96,24 @@ class AuditTrail:
 
     def _write_signal(self, signal: Signal, asset_result: Any, as_of_ms: int, now: int) -> None:
         raw = signal.raw
-        strategy_class = int(raw.detail.get("strategy_class", 0) or 0)
+        # Prefer what the strategy published; fall back to the registry rather than to 0.
+        #
+        # The silent `0` default is what made F-065 invisible: `build_signal` did not publish the
+        # class, so this line wrote 0 for every C1/C2/C3 signal and nothing ever raised. A default
+        # that is a *valid-looking value* for a column other code filters on is a bug with no
+        # symptom at the point it happens.
+        strategy_class = int(raw.detail.get("strategy_class") or 0)
+        if strategy_class not in (1, 2, 3, 4):
+            strategy_class = strategy_class_of(raw.strategy_id)
+            if strategy_class == 0:
+                log.warning(
+                    "signal_class_unknown", signal_id=raw.signal_id,
+                    strategy_id=raw.strategy_id,
+                    detail="this signal's strategy class could not be determined from its payload "
+                           "or from the registry, so it is stored as 0 and will not match any "
+                           "model filter",
+                    remediation="check that the strategy declares strategy_class and that "
+                                "build_signal still publishes it")
         self.store.conn.execute(
             """INSERT INTO signals (signal_id, strategy_id, strategy_version, strategy_class, asset,
                    product, direction, state, state_since_ms, tier, validated, mode, armed_at_ms,

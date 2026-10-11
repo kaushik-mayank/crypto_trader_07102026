@@ -1083,6 +1083,7 @@ against a fresh holdout; API-change drill.
 | **D-57** | Analytics publishes **five** rates, each with its numerator, denominator and a prose definition; a zero denominator is `None` | "The hit rate" has two legitimate readings that differ by a lot — 3 of 5 resolved is 60%, 3 of 12 issued is 25% — so neither is called "the" rate and both are shown. The fraction travels with every figure so any number can be checked against a direct query. `0.0` on an empty sample would read as "nothing ever hit", a claim about the market; `None` is a claim about the sample and is the true one (F-064) |
 | **D-58** | The five terminal states that are **not** a trade result are counted in their own bucket, never folded into a rate's denominator and never dropped | `specs/07` §8 has seven terminal states and only `TARGET_HIT`/`STOPPED` are a trade result. On the verification fixture the other five are *more than half* the suggestions. In the denominator they understate every strategy; dropped, they hide the operationally important cases — everything being `SUPPRESSED` by arbitration, or `MISSED` during an outage. The page shows the buckets summing to the total so none can be lost silently (F-064) |
 | **D-59** | Analytics aggregates in SQL over a bounded window and the page does not poll | Four `GROUP BY` queries over an index range, ≤ 6 SELECTs per page (asserted through sqlite's trace callback), window capped at 366 days. Counts over whole days change when a suggestion resolves, not every fifteen seconds, so a timer would spend the VM's cycles redrawing identical numbers — and aggregating in the browser would also move the UTC day boundary into the viewer's timezone |
+| **D-60** | The strategy class is published by `build_signal` from the strategy's own declaration, and the writer falls back to the registry rather than to `0` | A default of `0` satisfied a `NOT NULL` column that other code filters on, so three of four model filters matched nothing and nothing raised anywhere — the symptom appeared as chip counts that could not be reconciled against the list below them. **A default that is a valid-looking value for a filtered column is a bug with no symptom where it happens.** `strategy_class_of()` is the one derivation, and an unclassifiable id logs rather than storing a plausible lie (F-065) |
 | **D-16** | Every ruff ignore carries an inline reason | The ignores are deliberate patterns (long-lived recorder handles, pairwise `zip`, `Kind(str, Enum)`), not unfixed warnings. An unexplained ignore is indistinguishable from neglect |
 
 ---
@@ -1603,6 +1604,52 @@ cache's lifetime, a wrong answer rather than a stale one. The cache also now cop
   actually writes — which is what F-056 was.
 * **The analytics numbers are not performance evidence.** Nothing is validated, outcomes are
   hypothetical and uncosted, and the engine says so on the page.
+
+
+### PHASE-36 — The model classification was never written, and the live card had no timestamp (2026-10-11)
+
+Two issues reported from the deployed dashboard. One was cosmetic, one was a data-correctness defect
+that made the filters arithmetically impossible.
+
+#### The filters: `Correction 0, Persistence 0, Transition 0, Established 13` over a longer list
+
+`_write_signal` read `raw.detail["strategy_class"]` with a default of **0**, and `build_signal`
+never published it. Only the C4 strategies pass the class in their own `detail=` kwarg, so **class 4
+was stored correctly and classes 1–3 were stored as 0** — and the dashboard filters on that
+column. Three of four filters matched nothing, their counts read zero, and the orphaned suggestions
+were counted under a `"0"` key the frontend never rendered (F-065).
+
+| Path | Change |
+|---|---|
+| `src/strategy/evaluation.py` | `build_signal` publishes `int(strategy.strategy_class)` — the strategy's own declaration |
+| `src/strategy/registry.py` | `strategy_class_of()` — one implementation: the registered strategy's declared class, falling back to the `C<n>-` prefix for an unregistered id |
+| `src/audit/trail.py` | The writer falls back to the registry instead of to `0`, and logs `signal_class_unknown` when even that fails |
+| `src/store/migrations.py` | **Migration 4** repairs rows already written: scoped to `strategy_class NOT IN (1,2,3,4) AND strategy_id GLOB 'C[1-4]-*'`, derived from the id in the same row |
+| `frontend/components/Suggestions.tsx` | `modelList` appends any bucket outside the four instead of dropping it; `unclassifiedCount()` |
+| `frontend/app/page.tsx` | A red line when the counts cannot add up to the list, naming the likely cause |
+| `frontend/components/Panels.tsx` | The live card shows **suggested** (`created_at_ms`) and, when it differs, **state changed** (`state_since_ms`) |
+
+Migration 4 is a **repair, not a reinterpretation**: the correct value was always determined by the
+`strategy_id` in the same row under the mapping the registry has always had, and it changes no
+outcome, status, price or timestamp. Verified on a fixture reproducing the bug — C1/C2/C3 corrected,
+C4 untouched, an unparseable id left at 0 rather than guessed, states and `created_at_ms` unchanged,
+idempotent on re-run, 0.003 s on the development database.
+
+#### The live card's missing timestamp
+
+`HistoryRow` showed the issue time and `SignalCard` showed none, so the most time-sensitive view was
+the one that could not say how old a suggestion was — and a setup at an hourly horizon stays live
+for hours by design. **Nothing was missing from the data**: `created_at_ms` has always been written
+and is stable (F-063), so every existing suggestion displays its real creation time as soon as the
+dashboard is redeployed (F-066).
+
+#### Why it shipped
+
+Every existing test inserted signals **by hand with an explicit class**, so none exercised the write
+path that was defaulting it. The new test goes through the real `_write_signal` with no class in the
+payload — the exact shape the bug produced — and asserts all four land correctly.
+
+**917 tests pass**, ruff and mypy clean on 135 files.
 
 
 ## Next Action

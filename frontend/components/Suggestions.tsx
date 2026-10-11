@@ -42,7 +42,18 @@ export const FALLBACK_MODELS: ModelMeta[] = [
     mechanism: 'external evidence', summary: 'published, documented edges' },
 ];
 
-/** The engine's `models` map, ordered by class, with counts where the payload carried them. */
+/**
+ * The engine's `models` map, ordered by class, with counts where the payload carried them.
+ *
+ * **Any bucket in `by_model` that is not one of the four is appended, not dropped.** That omission
+ * is what hid F-065 for as long as it lasted: every C1/C2/C3 signal was persisted with
+ * `strategy_class = 0`, the engine counted them under a `"0"` key, and this function only ever
+ * looked at keys 1-4 — so the chips read `Correction 0, Persistence 0, Transition 0, Established 13`
+ * while the list below them showed far more than 13. The discrepancy was visible on screen and
+ * unexplainable from it.
+ *
+ * A count that does not appear anywhere cannot be reconciled, so now it appears.
+ */
 export function modelList(payload: any): ModelMeta[] {
   const published = payload?.models;
   const counts = payload?.by_model ?? {};
@@ -51,7 +62,36 @@ export function modelList(payload: any): ModelMeta[] {
         .sort()
         .map((k) => ({ ...(published[k] as ModelMeta), id: String(k) }))
     : FALLBACK_MODELS;
-  return base.map((m) => ({ ...m, count: counts[m.id]?.count }));
+  const known = new Set(base.map((m) => m.id));
+  const extra: ModelMeta[] = Object.keys(counts)
+    .filter((k) => !known.has(k) && (counts[k]?.count ?? 0) > 0)
+    .sort()
+    .map((k) => ({
+      id: k,
+      key: `unclassified-${k}`,
+      short: 'Unclassified',
+      name: `unclassified (strategy_class = ${k})`,
+      mechanism: 'unknown',
+      summary:
+        'these suggestions were stored without a valid strategy class, so they belong to no ' +
+        'model filter. That is an engine defect, not a market condition — report it.',
+    }));
+  return [...base, ...extra].map((m) => ({ ...m, count: counts[m.id]?.count }));
+}
+
+/**
+ * The number of suggestions the model counts do not account for.
+ *
+ * Rendered next to the filter so the chips can always be reconciled against the list. If this is
+ * ever non-zero, the chips and the list below them genuinely disagree and the reader deserves to
+ * know which number to doubt.
+ */
+export function unclassifiedCount(payload: any): number {
+  const counts = payload?.by_model ?? {};
+  const known = new Set(Object.keys(payload?.models ?? {}));
+  return Object.keys(counts)
+    .filter((k) => !known.has(k))
+    .reduce((n, k) => n + (counts[k]?.count ?? 0), 0);
 }
 
 /**

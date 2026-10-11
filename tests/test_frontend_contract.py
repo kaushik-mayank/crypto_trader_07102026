@@ -893,3 +893,58 @@ def test_the_four_pages_are_all_in_the_nav():
     for path in ("app/page.tsx", "app/chart/page.tsx", "app/data/page.tsx",
                  "app/analytics/page.tsx"):
         assert (FRONTEND / path).exists(), f"{path} does not exist"
+
+
+# ---- the live card's issue time, and the unexplainable count (F-065, F-066) -----------------
+
+def test_a_live_suggestion_card_shows_when_it_was_issued():
+    """The history view showed the issue time and the live cards did not, which left the most
+    time-sensitive view as the one that could not answer "how old is this?" — and a setup at an
+    hourly horizon legitimately stays live for hours, so being on screen says nothing about age."""
+    panels = _require(FRONTEND / "components" / "Panels.tsx")
+    card = panels.split("export function SignalCard", 1)[1]
+    assert "created_at_ms" in card, "the live card must read the issue time"
+    assert "utcStamp(signal.created_at_ms)" in card
+    assert ">suggested<" in card or "suggested" in card
+
+
+def test_the_live_card_distinguishes_the_issue_time_from_the_last_state_change():
+    """Both are useful and they are different questions: when it was first suggested, and when it
+    last moved. One number shown for both would make a setup detected yesterday and triggered an
+    hour ago look like an hour-old suggestion."""
+    card = _require(FRONTEND / "components" / "Panels.tsx").split(
+        "export function SignalCard", 1)[1]
+    assert "state_since_ms" in card
+    assert "state changed" in card
+
+
+def test_an_unclassified_model_bucket_is_rendered_rather_than_dropped():
+    """This is what made F-065 unexplainable from the screen. Every C1/C2/C3 signal was persisted
+    with `strategy_class = 0`, the engine counted them under a `"0"` key, and `modelList` only ever
+    looked at keys 1-4 — so the chips read `Correction 0, Persistence 0, Transition 0,
+    Established 13` while the list below showed far more than 13.
+
+    A count that appears nowhere cannot be reconciled against the list, so now it appears.
+    """
+    suggestions = _without_comments(_require(FRONTEND / "components" / "Suggestions.tsx"))
+    assert "export function unclassifiedCount" in suggestions
+    assert "known.has(k)" in suggestions, "keys outside the four must be appended, not filtered out"
+
+    page = _require(FRONTEND / "app" / "page.tsx")
+    assert "unclassifiedCount" in page
+    assert "no valid model class" in page
+    assert "counts will not add up" in page, (
+        "the reader must be told the chips and the list disagree, not left to add them up"
+    )
+
+
+def test_the_engine_reports_an_unclassified_bucket_at_all():
+    """The frontend can only render it if the engine sends it. Both halves asserted, because the
+    defect needed both to be wrong."""
+    import inspect
+
+    from api.services import SignalService
+
+    source = inspect.getsource(SignalService._group_by_model)
+    assert "unclassified" in source
+    assert "out.setdefault" in source, "a class outside the four must be added, not skipped"

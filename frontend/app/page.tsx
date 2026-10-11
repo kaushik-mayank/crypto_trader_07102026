@@ -11,7 +11,7 @@
 import { useCallback, useEffect, useState } from 'react';
 
 import { ActionBar, Down, Empty, ExposureStrip, Freshness, HealthPanel, SignalCard, Warming } from '@/components/Panels';
-import { DayPicker, HistoryRow, ModelFilter, StatusFilter, modelList } from '@/components/Suggestions';
+import { DayPicker, HistoryRow, ModelFilter, StatusFilter, modelList, unclassifiedCount } from '@/components/Suggestions';
 import { REFRESH_MS, api, type ApiResult } from '@/lib/api';
 import { ageText, panelState } from '@/lib/honesty';
 
@@ -117,6 +117,9 @@ export default function Page() {
   // Labels come from the engine's own `models` map (the canonical specs/03-06 titles), with counts
   // where the payload carried them. The frontend never derives a model from a strategy id.
   const models = modelList(payloadData);
+  // Non-zero means the chips and the list below them genuinely disagree, and the reader
+  // deserves to be told which number to doubt rather than discovering it by adding up.
+  const unclassified = unclassifiedCount(payloadData);
   const historyData = (history?.payload as any)?.data;
   const historySignals: any[] = Array.isArray(historyData?.signals) ? historyData.signals : [];
 
@@ -194,6 +197,16 @@ export default function Page() {
               <ModelFilter models={models} value={model} onChange={setModel} />
               {view === 'history' && <StatusFilter value={status} onChange={setStatus} />}
             </div>
+            {unclassified > 0 && (
+              <p className="age age-red" style={{ margin: '10px 0 0' }}>
+                {unclassified} suggestion{unclassified === 1 ? '' : 's'} here{' '}
+                {unclassified === 1 ? 'has' : 'have'} no valid model class, so{' '}
+                {unclassified === 1 ? 'it belongs' : 'they belong'} to none of the filters above and
+                the counts will not add up to the list below. That is an engine defect, not a market
+                condition — the VM is probably running a version from before the classification was
+                fixed, so update it.
+              </p>
+            )}
             <p style={{ margin: '10px 0 0', color: 'var(--muted)' }}>
               <strong style={{ color: 'var(--text)' }}>Live</strong> is what the engine is tracking
               now — a setup detected, at its trigger, or triggered and being followed.{' '}

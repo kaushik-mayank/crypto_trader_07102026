@@ -14,6 +14,7 @@ performance *distribution* rather than a single path — one random path proves 
 """
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from typing import Any
 
@@ -99,6 +100,38 @@ def benchmark_mode(params: dict[str, Any]) -> list[Any]:
     return [C4A(params=params, mode="benchmark"),
             C4B(params=params, mode="benchmark"),
             C4C(params=params, mode="benchmark")]
+
+
+def strategy_class_of(strategy_id: str) -> int:
+    """The strategy class an id belongs to, or ``0`` when the id is not one this build knows.
+
+    One implementation, because the class is persisted on every signal row and a second derivation
+    would be a second thing to keep in step. It reads the **declared** class off the registered
+    strategy rather than parsing the id, so a strategy whose id and class ever disagreed would
+    report its declaration, which is the authority.
+
+    The `C<n>-` prefix is the fallback, and it is only reached for an id this build no longer
+    registers — a signal written by an older version, which the repair migration has to classify
+    without being able to construct the strategy.
+    """
+    for strategy in _classification_table():
+        if strategy.id == strategy_id:
+            return int(strategy.strategy_class)
+    match = re.match(r"^C([1-4])-", strategy_id or "")
+    return int(match.group(1)) if match else 0
+
+
+#: Built once, with empty params: only `.id` and `.strategy_class` are read, and both are class
+#: attributes that do not depend on parameters. Constructing these on every call would make a
+#: classification lookup cost a strategy construction.
+_ALL_FOR_CLASSIFICATION: tuple[Any, ...] = ()
+
+
+def _classification_table() -> tuple[Any, ...]:
+    global _ALL_FOR_CLASSIFICATION
+    if not _ALL_FOR_CLASSIFICATION:
+        _ALL_FOR_CLASSIFICATION = tuple(backtest_strategies({}))
+    return _ALL_FOR_CLASSIFICATION
 
 
 def _assert_registry(strategies: Sequence[Any], *, expected: Sequence[str],
