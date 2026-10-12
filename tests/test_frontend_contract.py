@@ -948,3 +948,182 @@ def test_the_engine_reports_an_unclassified_bucket_at_all():
     source = inspect.getsource(SignalService._group_by_model)
     assert "unclassified" in source
     assert "out.setdefault" in source, "a class outside the four must be added, not skipped"
+
+
+# ---- IST timestamp display (Phase 3) --------------------------------------------------------
+
+def test_the_suggestion_timestamp_is_rendered_in_ist():
+    """The acceptance criterion: 2026-10-12 06:21 UTC must display as 2026-10-12 11:51 IST.
+
+    Node is not installed here so the TypeScript cannot be executed; the arithmetic is therefore
+    verified in Python against the same fixed offset the implementation uses, and the implementation
+    is checked to use that offset and nothing else.
+    """
+    import datetime as dt
+
+    suggestions = _require(FRONTEND / "components" / "Suggestions.tsx")
+    assert "export function istStamp" in suggestions
+    assert "const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000" in suggestions
+
+    epoch_ms = int(dt.datetime(2026, 10, 12, 6, 21, tzinfo=dt.UTC).timestamp() * 1000)
+    shifted = dt.datetime.fromtimestamp((epoch_ms + 5.5 * 3600 * 1000) / 1000, dt.UTC)
+    assert shifted.strftime("%Y-%m-%d %H:%M") == "2026-10-12 11:51"
+
+
+def test_the_ist_conversion_crosses_midnight_correctly():
+    """A time without its date would be a different day's reading. 2026-10-12 20:00 UTC is
+    2026-10-13 01:30 IST — the date must move with it, which is why `istStamp` emits one."""
+    import datetime as dt
+
+    epoch_ms = int(dt.datetime(2026, 10, 12, 20, 0, tzinfo=dt.UTC).timestamp() * 1000)
+    shifted = dt.datetime.fromtimestamp((epoch_ms + 5.5 * 3600 * 1000) / 1000, dt.UTC)
+    assert shifted.strftime("%Y-%m-%d %H:%M") == "2026-10-13 01:30"
+
+    suggestions = _require(FRONTEND / "components" / "Suggestions.tsx")
+    stamp = suggestions.split("export function istStamp", 1)[1].split("export function", 1)[0]
+    assert "getUTCFullYear" in stamp and "getUTCMonth" in stamp and "getUTCDate" in stamp, (
+        "the date has to be part of the output, or a midnight crossing reads as the wrong day"
+    )
+
+
+def test_the_ist_stamp_does_not_depend_on_the_viewers_timezone():
+    """Shifting the instant and then reading the **UTC** fields gives the IST wall clock on any
+    machine. Reading `getHours()` would add the viewer's own offset on top — the double conversion
+    that makes the same suggestion read differently in Mumbai and in London."""
+    stamp = _require(FRONTEND / "components" / "Suggestions.tsx").split(
+        "export function istStamp", 1)[1].split("export function", 1)[0]
+    for local_getter in ("getHours(", "getMinutes(", "getFullYear(", "getMonth(", "getDate("):
+        assert local_getter not in stamp, (
+            f"{local_getter} reads the viewer's local time and would double-convert"
+        )
+    assert "toLocale" not in stamp and "Intl." not in stamp
+
+
+def test_an_already_zoned_or_string_timestamp_is_parsed_not_patched():
+    """A value that already carries a zone must not have one appended or stripped — that is how a
+    timestamp gets shifted twice. `Date.parse` handles an ISO instant with an offset and a bare `Z`
+    identically, so the function parses and never rewrites the input."""
+    stamp = _require(FRONTEND / "components" / "Suggestions.tsx").split(
+        "export function istStamp", 1)[1].split("export function", 1)[0]
+    assert "Date.parse(value)" in stamp
+    for patching in ("Z'", 'Z"', ".replace(", "05:30'"):
+        assert patching not in stamp, f"{patching} rewrites the input instead of parsing it"
+    assert "Number.isFinite(epoch)" in stamp
+    assert "time unknown" in stamp
+
+
+def test_both_views_render_suggestion_times_in_ist():
+    """The live card and the history row, or the same suggestion reads differently depending on
+    which page you are on."""
+    panels = _require(FRONTEND / "components" / "Panels.tsx")
+    suggestions = _require(FRONTEND / "components" / "Suggestions.tsx")
+    assert "istStamp(signal.created_at_ms)" in panels
+    assert "istStamp(signal.state_since_ms)" in panels
+    assert "istStamp(issued)" in suggestions
+    assert "istStamp(changed)" in suggestions
+
+
+def test_the_utc_reading_stays_available_so_the_date_groups_reconcile():
+    """The date groups are UTC days — the engine's own grouping, which every bar is aligned to.
+    Changing it would alter which suggestions fall in which group, which is a data change rather
+    than a presentation one. So a suggestion issued late in a UTC day correctly shows an IST date a
+    day later, and the UI has to let a reader see that both are the same instant."""
+    panels = _require(FRONTEND / "components" / "Panels.tsx")
+    page = " ".join(_require(FRONTEND / "app" / "page.tsx").split())
+    assert "title={utcStamp(" in panels, "the UTC reading stays reachable on hover"
+    assert "Times are shown in" in page and "UTC days" in page
+    assert "IST date one day later" in page
+
+
+def test_market_data_timelines_are_not_converted():
+    """Explicitly out of scope and explicitly protected: candle axes, the analytics query
+    parameters and the day grouping all stay as they were. Converting a candle axis would change
+    what the chart claims about when a bar opened."""
+    candles = _require(FRONTEND / "components" / "CandleChart.tsx")
+    assert "istStamp" not in candles and "IST" not in candles, (
+        "the candle axis is market-data time and must not be shifted"
+    )
+    analytics = _require(FRONTEND / "app" / "analytics" / "page.tsx")
+    utc_day = analytics.split("function utcDay", 1)[1].split("}", 1)[0]
+    assert "getUTC" in utc_day, (
+        "the analytics window is sent to the engine as UTC calendar days; shifting it would change "
+        "which data is queried"
+    )
+    from api.services import DAY_MS, day_bounds
+
+    assert DAY_MS == 86_400_000
+    assert day_bounds("2026-10-12")[1] - day_bounds("2026-10-12")[0] == DAY_MS
+
+
+# ---- the Specs page (Phase 4) ---------------------------------------------------------------
+
+def test_the_specs_page_exists_and_is_reachable():
+    page = _require(FRONTEND / "app" / "specs" / "page.tsx")
+    nav = _require(FRONTEND / "components" / "Nav.tsx")
+    proxy = _require(PROXY_TS)
+    assert "'/specs'" in nav
+    assert "'api/specs'" in proxy
+    assert "api.specs" in page
+
+
+def test_the_specs_page_lists_every_series_from_the_engine():
+    """Served, not hard-coded: the implementation half is read from the live registry, so the page
+    cannot drift from the code."""
+    page = _require(FRONTEND / "app" / "specs" / "page.tsx")
+    assert "data?.series" in page or "data.series" in page
+    assert "spec_file" in page and "implementation" in page
+    for series in ("C1-A", "C2-B", "C3-C", "C4-X1"):
+        assert f"'{series}'" not in page, f"{series} is hard-coded; it must come from the engine"
+
+
+def test_the_specs_page_surfaces_a_gap_rather_than_hiding_it():
+    """A Specs page that silently omits a strategy is worse than none."""
+    page = _require(FRONTEND / "app" / "specs" / "page.tsx")
+    assert "This index is incomplete" in page
+    assert "unmapped" in page and "orphaned" in page
+
+
+def test_the_five_pages_are_all_in_the_nav():
+    nav = _require(FRONTEND / "components" / "Nav.tsx")
+    for href in ("'/'", "'/chart'", "'/data'", "'/analytics'", "'/specs'"):
+        assert href in nav, f"{href} is missing from the nav"
+    for path in ("app/page.tsx", "app/chart/page.tsx", "app/data/page.tsx",
+                 "app/analytics/page.tsx", "app/specs/page.tsx"):
+        assert (FRONTEND / path).exists(), f"{path} does not exist"
+
+
+# ---- the trail replaces the target in the UI (Issue A) --------------------------------------
+
+def test_a_trailed_suggestion_shows_its_trail_instead_of_none():
+    """`specs/06` §4.1 mandates no T1 for the trend strategies and `trail_level` published live. The
+    cell read "none — trailed" and the column was never written, so a trailed suggestion appeared to
+    have no exit at all."""
+    panels = _require(FRONTEND / "components" / "Panels.tsx")
+    assert "trailing stop" in panels
+    assert "signal.trail_level" in panels
+    assert "no fixed target by design" in panels
+    suggestions = _require(FRONTEND / "components" / "Suggestions.tsx")
+    assert "signal.trail_level" in suggestions
+
+
+def test_the_engine_persists_the_trail_level_column():
+    """Both halves asserted, because the defect needed both to be missing."""
+    import inspect
+
+    from audit.trail import AuditTrail
+
+    source = inspect.getsource(AuditTrail._write_signal)
+    assert "trail_level" in source.split("INSERT INTO signals")[1].split("VALUES")[0]
+    assert "trail_level=excluded.trail_level" in source
+
+
+def test_direction_is_updated_on_republish():
+    """The reported C3-C anomaly, asserted on the SQL."""
+    import inspect
+
+    from audit.trail import AuditTrail
+
+    update_clause = inspect.getsource(AuditTrail._write_signal).split("DO UPDATE SET", 1)[1]
+    assert "direction=excluded.direction" in update_clause
+    for frozen in ("created_at_ms", "armed_at_ms"):
+        assert f"{frozen}=excluded" not in update_clause, f"{frozen} must stay frozen"

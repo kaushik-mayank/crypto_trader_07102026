@@ -94,18 +94,60 @@ export function unclassifiedCount(payload: any): number {
     .reduce((n, k) => n + (counts[k]?.count ?? 0), 0);
 }
 
+/** Indian Standard Time, as a fixed offset in milliseconds. */
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
 /**
- * A timestamp, rendered in **UTC** with the label saying so.
+ * A suggestion timestamp, rendered in **Indian Standard Time**.
  *
- * UTC and not the viewer's locale, because the day grouping is UTC: a suggestion issued at 23:30
- * UTC would otherwise appear under one date in its heading and a different one in its own
- * timestamp, for every reader east of Greenwich. One of the two has to give, and moving the
- * boundary with the viewer makes the date groups unshareable — "look at the 10th" would mean
- * different sets of suggestions to two people.
+ * **Why a fixed offset rather than `Intl` with `timeZone: 'Asia/Kolkata'`.** IST is UTC+05:30 with
+ * no daylight saving and no historical transitions in any period this system can produce data for,
+ * so the arithmetic is exact — and it does not depend on the browser shipping a timezone database.
+ * `Intl` would be the right tool for a zone that has rules; here it would add a dependency on the
+ * viewer's ICU build to compute a constant.
+ *
+ * **Why the UTC getters after shifting.** Adding the offset and then reading `getUTC*` gives the
+ * IST wall-clock fields on *any* machine. Reading `getHours()` instead would add the viewer's own
+ * offset on top, so the same suggestion would read differently in Mumbai and in London — the
+ * double-conversion bug this shape exists to prevent.
+ *
+ * **Input.** `created_at_ms` and `state_since_ms` arrive as epoch-millisecond integers straight out
+ * of SQLite — no strings, no ISO, no embedded zone. A string is still accepted and parsed, because
+ * `Date.parse` handles both an ISO instant with an offset and a bare `Z`; what it must never do is
+ * treat an already-zoned value as if it were naive, which is why nothing here strips or appends a
+ * zone marker.
+ *
+ * The date is part of the output precisely because the conversion crosses midnight: 2026-10-12
+ * 20:00 UTC is 2026-10-13 01:30 IST, and a time without its date would be a different day's
+ * reading.
  */
-export function utcStamp(ms?: number | null): string {
-  if (ms === null || ms === undefined || !Number.isFinite(ms)) return 'time unknown';
-  const d = new Date(ms);
+export function istStamp(value?: number | string | null): string {
+  if (value === null || value === undefined || value === '') return 'time unknown';
+  const epoch = typeof value === 'number' ? value : Date.parse(value);
+  if (!Number.isFinite(epoch)) return 'time unknown';
+  const d = new Date(epoch + IST_OFFSET_MS);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return (
+    `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ` +
+    `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} IST`
+  );
+}
+
+/**
+ * Kept as the UTC reading of the same instant, for the one place that needs it: reconciling a
+ * suggestion's IST time against the **UTC** date group it is filed under.
+ *
+ * The grouping stays UTC deliberately — it is the engine's, every bar in the system is UTC-aligned,
+ * and moving it would change which suggestions fall in which group, which is a data change rather
+ * than a presentation one. So a suggestion issued late in a UTC day legitimately shows an IST date
+ * one day later than its heading, and this function is how the UI can show both and let the reader
+ * see that they are the same instant.
+ */
+export function utcStamp(value?: number | string | null): string {
+  if (value === null || value === undefined || value === '') return 'time unknown';
+  const epoch = typeof value === 'number' ? value : Date.parse(value);
+  if (!Number.isFinite(epoch)) return 'time unknown';
+  const d = new Date(epoch);
   const pad = (n: number) => String(n).padStart(2, '0');
   return (
     `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ` +
@@ -264,9 +306,9 @@ export function HistoryRow({ signal, models }: { signal: any; models: ModelMeta[
       </div>
 
       <div className="row" style={{ marginTop: 8 }}>
-        <span>
+        <span title={`${utcStamp(issued)} — the date groups above are UTC days`}>
           <span className="label">issued</span>
-          <span className="mono">{utcStamp(issued)}</span>
+          <span className="mono">{istStamp(issued)}</span>
         </span>
         <span>
           <span className="label">entry</span>
@@ -277,8 +319,12 @@ export function HistoryRow({ signal, models }: { signal: any; models: ModelMeta[
           <span className="mono">{signal.stop ?? '—'}</span>
         </span>
         <span>
-          <span className="label">target</span>
-          <span className="mono">{targets.length ? targets.join(', ') : 'none — trailed'}</span>
+          <span className="label">{targets.length ? 'target' : 'trailing stop'}</span>
+          <span className="mono">
+            {targets.length
+              ? targets.join(', ')
+              : (signal.trail_level ?? 'none — trailed from entry')}
+          </span>
         </span>
       </div>
 
@@ -287,7 +333,7 @@ export function HistoryRow({ signal, models }: { signal: any; models: ModelMeta[
       {typeof changed === 'number' && typeof issued === 'number' && changed > issued + 60_000 && (
         <p style={{ margin: '8px 0 0', color: 'var(--muted)' }}>
           <span className="label">outcome recorded</span>
-          <span className="mono">{utcStamp(changed)}</span>
+          <span className="mono" title={utcStamp(changed)}>{istStamp(changed)}</span>
           <span style={{ marginLeft: 8 }}>({ageText((Date.now() - changed) / 1000)})</span>
         </p>
       )}

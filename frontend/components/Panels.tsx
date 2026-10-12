@@ -7,7 +7,7 @@
  * small on purpose: all the judgement lives in `lib/honesty.ts` and in the engine's own payload, so
  * these are renderers, not deciders.
  */
-import { utcStamp } from '@/components/Suggestions';
+import { istStamp, utcStamp } from '@/components/Suggestions';
 import { ageState, ageText, concentrationNotice, confidenceCopy, directionPending, displayable, priceBasis, signalDetail, validationNotice, type PanelState } from '@/lib/honesty';
 
 /** Age, always as text and colour together — never colour alone. */
@@ -170,7 +170,9 @@ export function SignalCard({ signal }: { signal: Signal }) {
       <div className="row" style={{ marginTop: 8 }}>
         <span>
           <span className="label">suggested</span>
-          <span className="mono">{utcStamp(signal.created_at_ms)}</span>
+          <span className="mono" title={utcStamp(signal.created_at_ms)}>
+            {istStamp(signal.created_at_ms)}
+          </span>
           {typeof signal.created_at_ms === 'number' && (
             <span className="age age-ok" style={{ marginLeft: 8 }}>
               {ageText((Date.now() - signal.created_at_ms) / 1000)}
@@ -182,7 +184,9 @@ export function SignalCard({ signal }: { signal: Signal }) {
           signal.state_since_ms > signal.created_at_ms + 60_000 && (
             <span>
               <span className="label">state changed</span>
-              <span className="mono">{utcStamp(signal.state_since_ms)}</span>
+              <span className="mono" title={utcStamp(signal.state_since_ms)}>
+                {istStamp(signal.state_since_ms)}
+              </span>
             </span>
           )}
       </div>
@@ -219,9 +223,18 @@ export function SignalCard({ signal }: { signal: Signal }) {
             <span className="label">stop</span>
             <span className="mono">{signal.stop ?? '—'}</span>
           </span>
+          {/* **A trailed strategy has no fixed target by design, and that is not the same as
+              having no exit.** `specs/06` §4.1: "No T1: the position is trailed from entry... 
+              `trail_level` published live", and `c2_participation.py` says "the UI shows the live
+              trail instead". It did not: the column was never written and this cell read
+              "none — trailed", so a suggestion appeared to have no exit at all (F-068). */}
           <span>
-            <span className="label">target</span>
-            <span className="mono">{targets.length ? targets.join(', ') : 'none — trailed'}</span>
+            <span className="label">{targets.length ? 'target' : 'trailing stop'}</span>
+            <span className="mono">
+              {targets.length
+                ? targets.join(', ')
+                : (signal.trail_level ?? detail.trail_level ?? 'not yet set')}
+            </span>
           </span>
           {signal.sizing?.size && (
             <span>
@@ -274,6 +287,16 @@ export function SignalCard({ signal }: { signal: Signal }) {
             <span className="mono">{targets.length ? targets.join(', ') : '—'}</span>
           </p>
         </div>
+      )}
+
+      {isPrice && !pendingDirection && targets.length === 0 && (
+        <p style={{ margin: '8px 0 0', color: 'var(--muted)' }}>
+          This strategy publishes <strong>no fixed target by design</strong> — capping a trend
+          caps the one outcome it exists to capture. The exit is the trailing stop above, which
+          moves with the position and never loosens.
+          {!(signal.trail_level ?? detail.trail_level) &&
+            ' It is set once the entry triggers; until then the initial stop is the exit.'}
+        </p>
       )}
 
       {/* specs/15 failure mode 2: the blank confidence gets replaced by what the trade needs. */}

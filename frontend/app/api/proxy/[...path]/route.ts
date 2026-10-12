@@ -45,6 +45,7 @@ const ALLOWED = new Set([
   'api/events',
   'api/sources',
   'api/analytics',
+  'api/specs',
 ]);
 
 /** Paths whose last segment is a variable id, matched by shape. */

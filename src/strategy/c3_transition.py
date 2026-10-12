@@ -953,8 +953,16 @@ class C3C:
             state.context["branch"] = branch
             state.direction = direction
         price = price_now(features, snapshot)
-        levels = self._levels(ctx, features, snapshot, state)
+        # **`_trigger_state` before `_levels`, and the order is load-bearing.**
+        #
+        # `_trigger_state` is what computes and caches `failed_extreme`, and the rejection stop is
+        # defined by `specs/05` §5 as "beyond the failed extreme by s x ATR_1h". With the calls the
+        # other way round, the first pass after a resolution found no cached extreme and fell back
+        # to `state.context.get("failed_extreme", boundary)` — so the stop that got **persisted and
+        # displayed** on that pass was measured from the boundary instead, and only corrected on the
+        # next evaluation (F-067).
         act_state = self._trigger_state(state, features, snapshot, price)
+        levels = self._levels(ctx, features, snapshot, state)
         progress = advance(state, act_state=act_state, now_ms=snapshot.as_of_ms, price=price,
                            predicates=(lambda: self._chop_voided(state),),
                            stop=levels.stop, targets=levels.targets)
@@ -1079,9 +1087,23 @@ class C3C:
             extreme = Decimal(str(state.context.get("failed_extreme", boundary)))
             entry = boundary
             stop = extreme + s * atr if not long else extreme - s * atr
+            # `specs/05` §5: T1 is "the opposite side of the range, or SMA_N -- wide". Two
+            # spec-sanctioned options, and the SMA is only an approximation of the first **when it
+            # is actually on the opposite side**. Taken raw it was not checked, so a rejection whose
+            # trailing mean sat behind the entry published a target on the wrong side of it — and a
+            # target behind the entry is hit the instant the position opens, which recorded an
+            # immediate false TARGET_HIT (F-067).
+            #
+            # When the mean is on the wrong side the strategy falls back to the spec's *other*
+            # option, the measured move. That is choosing between two documented alternatives, not
+            # inventing a third.
+            measured = entry + 2 * atr if long else entry - 2 * atr
             sma = detail_of(features, "DEV_Z", Timeframe.H1, "medium").get("sma")
-            target = (Decimal(repr(float(sma))) if sma is not None
-                      else (entry + 2 * atr if long else entry - 2 * atr))
+            target = measured
+            if sma is not None:
+                candidate = Decimal(repr(float(sma)))
+                beyond_entry = candidate > entry if long else candidate < entry
+                target = candidate if beyond_entry else measured
             basis = ("the opposite side of the range, approximated by the trailing mean -- wide "
                      "against a tight stop just beyond the failed extreme")
             stop_basis = ("s x ATR_1h beyond the failed extreme -- the tightest stop either branch "

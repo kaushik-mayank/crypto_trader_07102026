@@ -61,6 +61,8 @@ export const api = {
   regime: () => get('api/regime'),
   warmup: () => get('api/warmup'),
   rejections: (asset: string) => get(`api/assets/${encodeURIComponent(asset)}/rejections`),
+  /** Where each strategy series is specified and implemented. */
+  specs: () => get('api/specs'),
   /** Every source the engine fetches, with its newest row and last value. */
   sources: () => get('api/sources'),
   /**

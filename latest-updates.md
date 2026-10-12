@@ -1084,6 +1084,9 @@ against a fresh holdout; API-change drill.
 | **D-58** | The five terminal states that are **not** a trade result are counted in their own bucket, never folded into a rate's denominator and never dropped | `specs/07` §8 has seven terminal states and only `TARGET_HIT`/`STOPPED` are a trade result. On the verification fixture the other five are *more than half* the suggestions. In the denominator they understate every strategy; dropped, they hide the operationally important cases — everything being `SUPPRESSED` by arbitration, or `MISSED` during an outage. The page shows the buckets summing to the total so none can be lost silently (F-064) |
 | **D-59** | Analytics aggregates in SQL over a bounded window and the page does not poll | Four `GROUP BY` queries over an index range, ≤ 6 SELECTs per page (asserted through sqlite's trace callback), window capped at 366 days. Counts over whole days change when a suggestion resolves, not every fifteen seconds, so a timer would spend the VM's cycles redrawing identical numbers — and aggregating in the browser would also move the UTC day boundary into the viewer's timezone |
 | **D-60** | The strategy class is published by `build_signal` from the strategy's own declaration, and the writer falls back to the registry rather than to `0` | A default of `0` satisfied a `NOT NULL` column that other code filters on, so three of four model filters matched nothing and nothing raised anywhere — the symptom appeared as chip counts that could not be reconciled against the list below them. **A default that is a valid-looking value for a filtered column is a bug with no symptom where it happens.** `strategy_class_of()` is the one derivation, and an unclassifiable id logs rather than storing a plausible lie (F-065) |
+| **D-61** | The signal row's UPSERT updates every column that describes the signal's **current** state, and freezes only identity and provenance | `direction` was frozen while `entry`/`stop`/`targets` were updated, so a C3-C that armed pending as a placeholder LONG and resolved SHORT was stored as a long whose stop sat above its entry — the reported suggestion. `as_of_ms`, `snapshot_id` and the regime were frozen the same way, making the row claim a provenance its levels did not come from. `created_at_ms` and `armed_at_ms` stay frozen, because a suggestion must not migrate between date groups when its outcome is recorded (F-067) |
+| **D-62** | Where a strategy publishes no fixed target, the UI shows the **live trail** rather than the word "none" | `specs/06` §4.1 mandates no T1 for the trend strategies *and* `trail_level` published live; `c2_participation.py` says "the UI shows the live trail instead". The trail was computed and published in the detail, never persisted and never displayed, so a correct design read as a half-built suggestion with no exit. Fixed at both ends rather than by manufacturing a target, which would contradict the one thing those specs are most emphatic about (F-068) |
+| **D-63** | Suggestion timestamps display in **IST via a fixed +05:30 offset**; the UTC day grouping and every market-data timeline stay UTC | IST has no DST, so the arithmetic is exact and needs no browser timezone database; shifting the instant and reading `getUTC*` is viewer-independent, where `getHours()` would double-convert. The grouping stays UTC because moving it would change which suggestions fall in which group — a data change rather than a presentation one — so a late-UTC-day suggestion shows an IST date one day later, and the UI states that and offers the UTC reading on hover (F-069) |
 | **D-16** | Every ruff ignore carries an inline reason | The ignores are deliberate patterns (long-lived recorder handles, pairwise `zip`, `Kind(str, Enum)`), not unfixed warnings. An unexplained ignore is indistinguishable from neglect |
 
 ---
@@ -1650,6 +1653,83 @@ path that was defaulting it. The new test goes through the real `_write_signal` 
 payload — the exact shape the bug produced — and asserts all four land correctly.
 
 **917 tests pass**, ruff and mypy clean on 135 files.
+
+
+### PHASE-37 — C3-C resolution defects, the missing trail, IST display and a Specs page (2026-10-12)
+
+A specification audit of C1-C, C2-C, C3-C and C4-C against `specs/03`–`specs/06`, three confirmed
+calculation/persistence defects, an IST presentation change and a fifth page.
+
+#### Confirmed root causes
+
+| Reported symptom | Verified cause | Finding |
+|---|---|---|
+| `B-SOL_USDT LONG C3-C`, stop 113.91 **above** entry 112.73 | `direction` was **not in the UPSERT**. C3-C arms pending with a placeholder LONG; the resolution assigned SHORT, the levels updated, the direction did not. Reproduced byte-identically before fixing | **F-067** |
+| the same suggestion recorded "Target hit" immediately | the rejection target took `SMA_N` raw without checking it was on the opposite side of entry. A target behind the entry satisfies `_manage_triggered`'s comparison at the entry price itself | **F-067** |
+| — (found while tracing) | `_levels` ran **before** `_trigger_state`, which caches `failed_extreme`, so the first resolved pass persisted a stop measured from the boundary instead of "beyond the failed extreme" | **F-067** |
+| "most suggestions show entry and stop but no target" | the missing target is **correct** — `specs/06` §4.1 mandates no T1 for the trend strategies. The defect was that `trail_level`, which the spec requires "published live", **was not in the INSERT at all** and the UI read "none — trailed" | **F-068** |
+| C1-C negative entry and stop | **no calculation defect.** Traced against `specs/03` §5: these are residual (spread) units, negative for about half of all LONG setups by construction, with `stop < entry < target = 0` correct. The display fix is F-051/F-058; it needs the VM updated | F-061 (re-verified) |
+| C3-C blank entries | **correct.** A pending C3-C has no entry by design — the direction decides it — and the dashboard renders "DIRECTION NOT YET DECIDED" | — |
+
+#### Files changed
+
+| Path | Change |
+|---|---|
+| `src/audit/trail.py` | `direction`, `trail_level`, `as_of_ms`, `snapshot_id`, `regime_cell`, `regime_dwell`, `original_entry_price` now follow a republish; `trail_level` added to the INSERT. Identity and provenance stay frozen |
+| `src/strategy/c3_transition.py` | **two edits only**: `_trigger_state` before `_levels`, and the rejection target falls back to the measured move when the mean is behind the entry |
+| `src/api/spec_map.py` | **New** — `SPEC_MAP` (series to spec file, section, heading) merged with the live registry for the implementation half |
+| `src/api/app.py` | `GET /api/specs` |
+| `frontend/components/Suggestions.tsx` | `istStamp()` — fixed +05:30, UTC getters, browser-independent; `utcStamp` kept for reconciliation |
+| `frontend/components/Panels.tsx` | IST on the live card; the trailing stop shown where there is no fixed target, with one line saying why |
+| `frontend/app/specs/page.tsx` | **New** — the fifth page, grouped by class, engine-served |
+| `frontend/components/Nav.tsx`, `lib/api.ts`, proxy allow-list | Specs wired in |
+| `tests/test_spec_map.py`, `tests/test_signal_fields.py` | **New** — 13 + 10 tests |
+| `tests/test_frontend_contract.py` | +14 on IST, the Specs page and the trail |
+
+#### Regression protection for C3-C and C4-C
+
+`git diff HEAD` is **empty** for `c4_established.py`, `c1_correction.py`, `c1c_relative.py`,
+`c2_participation.py`, `risk/engine.py` and `strategy/lifecycle.py`. C3-C has exactly two changes,
+and the target change is **strictly narrowing**: where the mean is on the correct side the output is
+byte-identical to before. All four quadrants (long/short x mean ahead/behind) are asserted, and a
+test pins that a pending C3-C still publishes no levels at all.
+
+#### Specification mapping (all 14 series, verified against the files)
+
+| Class | Series | Specified in |
+|---|---|---|
+| 1 Correction & Rebalancing | C1-A, C1-B, C1-C | `specs/03-class1-correction.md` §3, §4, §5 |
+| 2 Trend Persistence & Participation | C2-A, C2-B, C2-C | `specs/04-class2-participation.md` §3, §4, §5 |
+| 3 Anticipatory Transition | C3-A, C3-B, C3-C | `specs/05-class3-transition.md` §3, §4, §5 |
+| 4 Established Methodologies | C4-A, C4-B, C4-C | `specs/06-class4-established.md` §4.1, §4.2, §4.3 |
+| 4 (controls, never tradeable) | C4-X1, C4-X2 | `specs/06-class4-established.md` §5.1, §5.2 |
+
+`tests/test_spec_map.py` opens each file and asserts the **literal heading** is present, so a
+renumbered section fails a test instead of misdirecting a reader. The implementation half is read
+from the registry at runtime and cannot drift from the code.
+
+#### IST
+
+A fixed +05:30 offset applied to the instant, then read through `getUTC*` — exact (IST has no DST)
+and independent of the viewer's browser and its ICU data. Acceptance criterion verified:
+2026-10-12 06:21 UTC to 2026-10-12 11:51 IST, and the midnight crossing 20:00 UTC to **next day**
+01:30 IST.
+
+**The UTC day grouping is unchanged**, deliberately: it is the engine's, every bar is UTC-aligned,
+and moving it would change which suggestions fall in which group — a data change, not a
+presentation one. So a suggestion issued late in a UTC day shows an IST date one day after its
+heading; the history view says so in one line and every timestamp carries its UTC reading on hover.
+Candle axes, the analytics query parameters and `day_bounds` are untouched, asserted by test.
+
+#### Open
+
+**Q12.** `specs/05` §5 specifies C3-C's rejection entry as the ACT trigger; the implementation uses
+`boundary`. A confirmed deviation, and after the ordering fix it is a one-line change — but it moves
+every C3-C rejection entry and with it `k_net`, R:R and the risk gates, on a strategy the owner has
+identified as working. Left unchanged pending a decision. Every other strategy uses `act_state.e_t`
+as entry, so `boundary` is the outlier.
+
+**954 tests pass**, ruff and mypy clean on 136 files.
 
 
 ## Next Action

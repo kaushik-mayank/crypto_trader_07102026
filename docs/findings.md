@@ -2336,6 +2336,170 @@ The card now shows two timestamps when they differ, because they answer differen
 
 One number for both would make a setup detected yesterday and triggered an hour ago read as an
 hour-old suggestion. Rendered in UTC with the zone named, matching the date grouping (D-55).
+
+---
+
+## F-067 — A LONG whose stop sat above its entry: the direction was frozen while the levels moved ✅
+
+**Date:** 2026-10-12 · **Problem class:** application_bug · **Fixed, reproduced first**
+
+Reported suggestion:
+
+```
+B-SOL_USDT   LONG   C3-C   Transition   Target hit
+Issued 2026-10-12 06:21 UTC
+Entry 112.73   Stop-loss 113.91   Target 114.04
+```
+
+A long with its stop **above** its entry is not a trade. Traced rather than guessed, and the
+reproduction came out byte-identical to the report.
+
+### Cause 1 — `direction` was not in the UPSERT
+
+C3-C arms **pending**: `specs/05` §5 says "the setup arms *pending*. Direction is assigned by which
+resolution occurs", so `_arm` publishes `direction=Direction.LONG` as a *structural placeholder* and
+the resolution assigns the real side.
+
+`_write_signal`'s `ON CONFLICT DO UPDATE SET` updated `entry`, `stop` and `targets` — and **not
+`direction`**. So when the setup resolved as a rejection of an upside break (real side: SHORT), the
+row kept the placeholder while taking the SHORT's levels. Entry 112.73 with a stop at 113.91 *above*
+it is a perfectly ordinary SHORT; it was being displayed as a LONG.
+
+Reproduced through the real writer before touching anything:
+
+```
+after arming (pending):   {'direction': 'LONG',  'entry': None,     'stop': None}
+after resolving SHORT:    {'direction': 'LONG',  'entry': '112.73', 'stop': '113.91'}
+                                        ^^^^ the engine published SHORT
+```
+
+Fixed by adding `direction=excluded.direction`, along with the other columns that describe the
+signal's **current** state and were equally frozen: `as_of_ms`, `snapshot_id`, `regime_cell`,
+`regime_dwell`, `original_entry_price`. The per-evaluation history lives in `signal_audit`, which is
+where a trail belongs; this row is the latest state. Identity and provenance stay frozen —
+`created_at_ms`, `armed_at_ms`, `strategy_id`, `asset` — because a suggestion must not migrate
+between date groups when its outcome is recorded (F-063).
+
+### Cause 2 — the rejection target was never checked against the side of the trade
+
+`specs/05` §5 gives T1 for the rejection branch as "**The opposite side of the range, or `SMA_N`**
+— wide". The implementation took the SMA raw:
+
+```python
+target = (Decimal(repr(float(sma))) if sma is not None
+          else (entry + 2 * atr if long else entry - 2 * atr))
+```
+
+No check that the mean was *on* the opposite side. When it was not, the published target sat
+**behind** the entry — and `lifecycle._manage_triggered` compares price against T1 with no sanity
+check on the side, so for a SHORT at 112.73 with T1 at 114.04 the condition `price <= targets[0]` is
+satisfied by the entry price itself. **That records TARGET_HIT on the first evaluation after the
+trigger**, which is the reported outcome.
+
+The fix takes the spec's *other* documented option when the mean is on the wrong side — the measured
+move — rather than inventing a third. Where the mean is on the correct side the behaviour is
+byte-identical to before, which is the regression property that matters for a strategy that has been
+working.
+
+### Cause 3 — the levels were computed before the extreme they depend on
+
+`_manage` called `_levels()` and *then* `_trigger_state()`. `failed_extreme` is cached by
+`_trigger_state`, and the rejection stop is defined by the spec as "beyond the failed extreme by
+`s·ATR_1h`" — so on the first pass after a resolution `_levels` found nothing cached, fell back to
+`state.context.get("failed_extreme", boundary)`, and **persisted a stop measured from the boundary
+instead of the extreme**. Only corrected on the next evaluation, by which time the wrong value had
+been written and displayed. Fixed by swapping two calls.
+
+### What was deliberately not changed
+
+C3-C's formulas are otherwise untouched, and no other strategy was modified at all — `git diff`
+against `c4_established.py`, `c1_correction.py`, `c1c_relative.py`, `c2_participation.py`,
+`risk/engine.py` and `strategy/lifecycle.py` is **empty**. The two C3-C edits are the ordering swap
+and the target-side check; nothing else in the file moved.
+
+---
+
+## F-068 — The trailed strategies published no target *and* no trail, so they appeared to have no exit ✅
+
+**Date:** 2026-10-12 · **Problem class:** application_bug · **Fixed**
+
+Reported as "most suggestions display an entry price and stop-loss price but do not display a
+target". The absent target turned out to be **correct**, and the actual defect was the thing meant
+to stand in its place.
+
+`specs/06` §4.1, on C4-A:
+
+> **No T1:** the position is **trailed from entry**, because capping a trend strategy's winner is the
+> canonical way to destroy its expectancy. `trail_level` **published live**.
+
+and §4's summary table: `| Targets | None. Trailed from entry at s·ATR_1h; trail_level published
+live |`. `c2_participation.py`'s own module docstring says the same thing from the other side:
+"**T2 is deliberately not published**: a number there would be fiction, so **the UI shows the live
+trail instead**."
+
+So for C4-A, C4-B and the C2 remainder, no fixed target is the specification. Three of the four
+pieces were implemented:
+
+| Piece | State before |
+|---|---|
+| no T1 published | ✅ correct, by design |
+| `trail_level` computed, monotone, never loosening | ✅ `update_trail`, shared by five strategies |
+| `trail_level` put in the strategy's published detail | ✅ all three strategies do it |
+| **`trail_level` persisted** | ❌ **the column was not in the INSERT at all** |
+| **`trail_level` displayed** | ❌ the cell read `none — trailed` |
+
+So the column was always NULL, the UI showed no exit, and a reader saw a suggestion with an entry, a
+stop and nothing else — which looks like a half-built suggestion rather than a deliberate design.
+
+Fixed at both ends: the column is written from the published detail and updated on every republish,
+and the cell now reads **"trailing stop 83200"** where it read "none — trailed", with one line of
+copy explaining that no fixed target is deliberate and the trail is the exit. Before the entry
+triggers there is no trail yet, and the card says so rather than showing a blank.
+
+**Not** fixed by manufacturing a target. A target invented for C4-A would contradict the one thing
+its specification is most emphatic about.
+
+---
+
+## F-069 — Suggestion times display in IST; market-data timelines deliberately do not ✅
+
+**Date:** 2026-10-12 · **Problem class:** none (requested presentation change)
+
+Every timestamp render path was inventoried before anything was changed, and classified:
+
+| Path | What it is | Changed? |
+|---|---|---|
+| `Suggestions.tsx:utcStamp` → `istStamp` | **suggestion** issue and state-change times | ✅ now IST |
+| `CandleChart.tsx` axis labels | **market candle** open times | ❌ untouched — market-data timeline |
+| `analytics/page.tsx:utcDay` | the `start`/`end` **query parameters** the engine reads as UTC days | ❌ untouched — changing it changes which data is queried |
+| `DayPicker` / `days` labels | the engine's **UTC day grouping** | ❌ untouched — see below |
+| `ageText` | elapsed time ("4s ago") | ❌ timezone-independent by construction |
+| `toLocaleString` in chart/data/analytics | **number** formatting, not dates | ❌ not timestamps |
+
+**A fixed +05:30 offset, not `Intl`.** IST has no daylight saving and no transitions in any period
+this system can hold data for, so the arithmetic is exact — and it does not depend on the viewer's
+browser shipping a timezone database. The instant is shifted and then read through `getUTC*`, which
+yields the IST wall clock on **any** machine; reading `getHours()` would add the viewer's own offset
+on top, which is the double conversion this shape exists to prevent. A test asserts no local getter,
+no `toLocale`, and no `Intl` appears in the function.
+
+Acceptance criterion verified: **2026-10-12 06:21 UTC → 2026-10-12 11:51 IST**, and the midnight
+crossing with it (2026-10-12 20:00 UTC → **2026-10-13** 01:30 IST), which is why the function emits
+a date and not just a clock time.
+
+**The date grouping stays UTC, and that is a decision rather than an oversight.** It is the engine's
+grouping, every bar in the system is UTC-aligned (F-012), and moving it would change which
+suggestions fall into which group — a data change, where this was asked for as a presentation
+change. The consequence is honest and has to be stated in the UI: a suggestion issued late in a UTC
+day correctly shows an IST date one day *after* the heading it sits under. So the history view says
+so in one line, and every timestamp carries its UTC reading on hover, so the two can always be
+reconciled as the same instant.
+
+Nothing in the backend changed: no stored value, no API field, no serialisation format, no
+`day_bounds`, no candle timeline. Asserted by a test that checks `DAY_MS` and the half-open day
+range are untouched.
+
+---
 ## Open questions
 
 
@@ -2352,3 +2516,4 @@ hour-old suggestion. Rendered in UTC with the zone named, matching the date grou
 | Q9 | ~~Which `k` does a bare `MR_VR(1h)` mean?~~ **RESOLVED 2026-10-03.** The owner confirmed **k = 2** as canonical and the spec now states it explicitly; `MR_VR_K4`/`MR_VR_K8` must be named where wanted. | — | — |
 | Q10 | ~~Confirm `risk_per_trade` and `portfolio_vol_target`.~~ **RESOLVED 2026-10-03.** The owner confirmed **`risk_per_trade = 0.5%`** and **`portfolio_vol_target = 15%` annualised**. Both remain `status = "user"` in the registry: they are risk appetite, not market properties, so they are never swept (`specs/08` §11). | — | — |
 | Q11 | **`lookback_1h_short = 24` cannot host swings at the horizon's own scale.** F-038 measured the conflict: pivot availability on a 24-bar window caps θ at ~1.0, but the median swing spacing only reaches the derived 12-bar target around θ ≈ 2.0, where availability is 0.09. With `k = 3` confirmation, 24 bars is too short for 12-bar swings, so C2-A's structural stop necessarily references smaller swings than its own premise describes. Options: (a) accept it — θ = 0.75 is the availability-respecting end, and this is why θ is `provisional`; (b) read `STR_SWING` at `1h/medium` for the structural stop instead of `1h/short`, which costs no parameter and whose spacing does respond to θ; (c) change `lookback_1h_short`, which alters **every** 1h feature and the regime axes with it. | Nothing — (a) is in force and the system runs | Whether C2-A's structural stop should read the medium window, and whether the shared short lookback is right for structure at all |
+| Q12 | **C3-C's rejection entry is the boundary, where `specs/05` §5 specifies the ACT trigger.** The spec's entry row reads "ACT on the reclaim: `X*` = extreme of the failed break, `E(t) = X* ∓ δ·ATR_15m`"; `_levels` sets `entry = boundary` for both branches. `_trigger_state` *does* build that ACT state, and after this round's ordering fix it is available before `_levels` runs — so the change is now one line. It is **not** made, because it moves every C3-C rejection entry and therefore its `k_net`, R:R and the risk engine's gates, on a strategy the owner has identified as working. Every other strategy (C1-C, C2-A, C3-B, C4-B) uses `act_state.e_t` as entry, so `boundary` is the outlier. | Owner decision | Whether C3-C's rejection entry becomes the ACT trigger per spec, accepting that historical R:R figures for that branch were computed from a different entry |

@@ -117,15 +117,38 @@ class AuditTrail:
         self.store.conn.execute(
             """INSERT INTO signals (signal_id, strategy_id, strategy_version, strategy_class, asset,
                    product, direction, state, state_since_ms, tier, validated, mode, armed_at_ms,
-                   expires_at_ms, entry, stop, targets, risk_reward, k_net, breakeven_hit_rate,
-                   regime_cell, regime_dwell, original_entry_price, parameter_hash, code_version,
-                   snapshot_id, as_of_ms, payload, created_at_ms, updated_at_ms)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   expires_at_ms, entry, stop, targets, trail_level, risk_reward, k_net,
+                   breakeven_hit_rate, regime_cell, regime_dwell, original_entry_price,
+                   parameter_hash, code_version, snapshot_id, as_of_ms, payload, created_at_ms,
+                   updated_at_ms)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(signal_id) DO UPDATE SET
                    state=excluded.state, state_since_ms=excluded.state_since_ms,
+                   -- **`direction` belongs here, and its absence was a reported defect.**
+                   --
+                   -- C3-A and C3-C arm *pending*: they publish a placeholder direction and let the
+                   -- market assign the real one on resolution. Freezing the column at first write
+                   -- meant the placeholder survived while `entry`, `stop` and `targets` were
+                   -- updated to the resolved side — so a resolved SHORT was stored as a LONG
+                   -- carrying a SHORT's levels, i.e. a long whose stop sits above its entry. That
+                   -- is exactly the suggestion the owner reported (F-067).
+                   direction=excluded.direction,
                    entry=excluded.entry, stop=excluded.stop, targets=excluded.targets,
+                   -- The live trail, which replaces T1 for every trailed strategy. `specs/06` §4.1
+                   -- says "no T1: the position is trailed from entry, `trail_level` published
+                   -- live", and `c2_participation.py` says "the UI shows the live trail instead" —
+                   -- but the column was never in the INSERT at all, so it was always NULL and a
+                   -- trailed suggestion appeared to have no exit whatsoever (F-068).
+                   trail_level=excluded.trail_level,
                    risk_reward=excluded.risk_reward, k_net=excluded.k_net,
                    breakeven_hit_rate=excluded.breakeven_hit_rate,
+                   -- These describe the signal's *current* state and were frozen at first write, so
+                   -- a signal republished for hours reported the regime and the snapshot it was
+                   -- armed under. The per-evaluation history is preserved in `signal_audit`, which
+                   -- is where the trail belongs. This row is the latest state.
+                   regime_cell=excluded.regime_cell, regime_dwell=excluded.regime_dwell,
+                   original_entry_price=excluded.original_entry_price,
+                   snapshot_id=excluded.snapshot_id, as_of_ms=excluded.as_of_ms,
                    payload=excluded.payload, updated_at_ms=excluded.updated_at_ms""",
             (raw.signal_id, raw.strategy_id, raw.strategy_version, strategy_class, raw.asset,
              raw.product.value, raw.direction.value, raw.lifecycle.value, as_of_ms,
@@ -134,6 +157,9 @@ class AuditTrail:
              str(raw.entry) if raw.entry is not None else None,
              str(raw.stop) if raw.stop is not None else None,
              _json([str(t) for t in raw.targets]),
+             # The trailed strategies all publish `trail_level` in their levels detail; it simply
+             # had nowhere to land.
+             (str(raw.detail["trail_level"]) if raw.detail.get("trail_level") is not None else None),
              str(raw.reward_to_risk()) if raw.reward_to_risk() is not None else None,
              signal.detail.get("k_net"), signal.detail.get("breakeven_hit_rate"),
              _json(raw.regime.get("cell")), raw.regime.get("dwell_bars"),

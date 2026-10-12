@@ -312,6 +312,18 @@ def create_app(*, signals: SignalService, market: MarketService, health: HealthS
         return respond(analytics.overview(start=start, end=end, strategy_class=strategy_class,
                                           asset=asset, state=state))
 
+    @app.get("/api/specs")
+    def specs_index() -> Any:
+        """Where every strategy series is specified, and where it is implemented.
+
+        Served by the engine rather than hard-coded in the dashboard: the implementation half is
+        read from the registry at runtime, so the page cannot drift from the code.
+        """
+        from api.spec_map import spec_index
+
+        return respond(ServiceResult(payload=spec_index(),
+                                     envelope=market._envelope(None)))
+
     @app.get("/api/sources")
     def sources() -> Any:
         """What the system is actually fetching, with each source's newest row and last value.

@@ -232,6 +232,13 @@ export default function Page() {
             <>
               <div className="card">
                 <DayPicker days={days} value={day} onChange={setDay} />
+                <p style={{ margin: '10px 0 0', color: 'var(--muted)' }}>
+                  Times are shown in <strong>IST</strong>. The dates above are{' '}
+                  <strong>UTC days</strong> — the engine's own grouping, which every bar in the
+                  system is aligned to. So a suggestion issued late in a UTC day correctly shows an
+                  IST date one day later than the heading it sits under. Hover any timestamp to see
+                  the same instant in UTC.
+                </p>
               </div>
 
               {history?.transportError && (
