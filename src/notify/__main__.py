@@ -18,12 +18,19 @@ import argparse
 import signal
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 from config.settings import Settings
 from core.errors import ALL_ERRORS, ConfigError
 from core.logging import get_logger, setup_logging
-from notify.config import DEFAULT_ASSET, DEFAULT_STRATEGY, load_config
+from notify.config import (
+    DEFAULT_ASSET,
+    DEFAULT_ENV_FILE,
+    DEFAULT_STRATEGY,
+    load_config,
+    load_env_file,
+)
 from notify.telegram import check_credentials, send_message
 from notify.watcher import Watcher, ist, load_state
 from store.reader import ReadOnlyStore
@@ -52,6 +59,11 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--dry-run", action="store_true",
                       help="print the messages that would be sent, send nothing, and do not record "
                            "them as sent")
+    ap.add_argument("--env-file", type=Path, default=None,
+                    help=f"where to read CT_TELEGRAM__* from when they are not already in the "
+                         f"environment. Defaults to {DEFAULT_ENV_FILE}, which is the file systemd "
+                         f"gives the services — so this command sees the same values the service "
+                         f"does")
     ap.add_argument("--test-message", action="store_true",
                     help="send one plain test message to the configured chat and exit. The only "
                          "mode that sends anything not derived from a real suggestion")
@@ -61,7 +73,7 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging(settings.paths.log_dir, log_name="notify")
 
     try:
-        config = load_config()
+        config = load_config(env_file=args.env_file)
     except ConfigError as e:
         print(f"TELEGRAM NOTIFIER NOT CONFIGURED: {e.message}", file=sys.stderr)
         print(f"  likely cause: {e.likely_cause}", file=sys.stderr)
@@ -93,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
         watcher = Watcher(store=store, config=config, state=state)
 
         if args.check:
-            return _preflight(watcher, config)
+            return _preflight(watcher, config, env_file=args.env_file or DEFAULT_ENV_FILE)
 
         if args.once or args.dry_run:
             report = watcher.poll(dry_run=args.dry_run)
@@ -108,7 +120,7 @@ def main(argv: list[str] | None = None) -> int:
         store.close()
 
 
-def _preflight(watcher: Watcher, config: Any) -> int:
+def _preflight(watcher: Watcher, config: Any, *, env_file: Path) -> int:
     """Prove every link in the chain without notifying anyone.
 
     Each line is a separate check so the first failure names the thing to fix, rather than leaving
@@ -121,6 +133,20 @@ def _preflight(watcher: Watcher, config: Any) -> int:
     print(f"  chat id:       {config.chat_id}")
     print(f"  state file:    {config.state_file}")
     print(f"  poll interval: {config.poll_seconds:.0f}s")
+
+    # Where the values came from. The original failure was an operator correctly setting the
+    # variables in the systemd environment file and this command — which does not read it when run
+    # by hand — reporting them unset. Saying which source answered removes that whole class of
+    # confusion (F-071).
+    import os as _os
+
+    file_values, problem = load_env_file(env_file)
+    if "CT_TELEGRAM__BOT_TOKEN" in _os.environ:
+        print("  values from:   this shell's environment")
+    elif problem:
+        print(f"  values from:   nowhere — {problem}")
+    else:
+        print(f"  values from:   {env_file}  ({len(file_values)} setting(s) in it)")
 
     if config.asset != DEFAULT_ASSET or config.strategy_id != DEFAULT_STRATEGY:
         print(f"  NOTE: the filter has been overridden. The default is {DEFAULT_ASSET} "

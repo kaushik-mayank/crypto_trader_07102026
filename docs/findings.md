@@ -2582,6 +2582,88 @@ even for a read-only connection, so a read-only mount makes the database impossi
 `crypto-app.service` already records the same finding in the same words. The guarantee therefore
 lives in the connection, not the filesystem, and the unit says so rather than implying a
 kernel-level protection the deployment cannot support.
+## F-071 — `/etc/crypto-trader/env` is a *systemd* file; a hand-run command never sees it ✅
+
+**Date:** 2026-10-17 · **Problem class:** application_bug (mine — in the documentation, then in the
+code that made the documentation impossible) · **Fixed**
+
+### The report
+
+The owner added the Telegram variables to `/etc/crypto-trader/env`, correctly, and then ran the
+command F-070's guide told them to run:
+
+```
+$ sudo -u crypto ./.venv/bin/python -m notify --check
+TELEGRAM NOTIFIER NOT CONFIGURED: CT_TELEGRAM__BOT_TOKEN is not set
+```
+
+Their `ls -l` corroborated the file was fine: the mtime did not move across a second `nano`, so the
+first edit had saved and the second changed nothing.
+
+### Cause
+
+`EnvironmentFile=` is a **systemd directive**. systemd reads that file when it *starts a unit* and
+injects the variables into that unit's process. **A shell has never heard of the file.** So
+`sudo -u crypto ... -m notify --check` ran with none of those variables present, and the error
+message was literally true and completely misleading.
+
+Step 6 of `TELEGRAM_HOSTING.md` told an operator to verify their configuration *before* installing
+the service — a step that **could not work by construction**. The message named the variable, so it
+read as the operator's mistake. That is the worst shape a configuration error can have.
+
+Verified while diagnosing:
+
+* `EnvironmentFile` appears in exactly three places — the three `.service` units in
+  `deploy/azure/`. Nothing under `src/` read that path.
+* The other `--check` commands in the hosting guides survive the same gap only because every
+  setting they touch has a default (`auth_token: str = ""`), so they produce a *wrong-but-quiet*
+  answer instead of an error. The notifier has two settings with no sensible default, so it was the
+  first command where the gap could surface at all.
+
+### Fix
+
+`src/notify/config.py` now reads the environment file itself, as a **fallback**:
+
+| Source | Precedence | Why that order |
+|---|---|---|
+| the real environment | first | under systemd the variables are already injected, so the running service's behaviour is **byte-for-byte what it was** and the file is never opened |
+| `/etc/crypto-trader/env` (or `--env-file`) | second | makes a hand-run command see what the service sees, which is the property that was missing |
+| the dataclass default | third | unchanged |
+
+Four causes that look identical from outside are now reported separately, because each has a
+different fix:
+
+| What is true | What the error says |
+|---|---|
+| file missing | `/etc/crypto-trader/env does not exist` |
+| file present, unreadable by this user | `exists but this user cannot read it … run with 'sudo -u crypto ...'` |
+| line present, nothing after the `=` | `has a line for CT_TELEGRAM__BOT_TOKEN but nothing after the '='` |
+| no such line, file otherwise read | `has no line for it (the file was read and holds N other setting(s))` |
+
+That last parenthetical is the useful one: reporting that the file *was* read, and how many settings
+came out of it, rules out a permissions problem at a glance.
+
+The preflight now prints a `values from:` line naming the source and the count, so "I set it and it
+says unset" has a visible answer. `--env-file` overrides the path for anyone running from a
+different layout, and it is threaded into the preflight so the printed source is the one actually
+used (a first cut re-derived the default internally and printed `values from: nowhere` while the
+values had plainly loaded).
+
+### Verified
+
+Against a replica env file: values resolve from the file; a real environment variable still wins;
+all four failure modes report distinctly; and the forms an operator might plausibly type
+(`"42"`, `'42'`, `export …`, `KEY = 42`, a negative group id like `-1001234567890`, a token with
+extra colons) all parse to the right value. 16 tests added, `tests/test_notify.py` now 52.
+
+### What this generalises to
+
+A verification step must use the same configuration path as the thing it verifies, or it certifies
+nothing. The preflight was testing a process that had never loaded the configuration it was
+reporting on.
+
+---
+
 ## Open questions
 
 

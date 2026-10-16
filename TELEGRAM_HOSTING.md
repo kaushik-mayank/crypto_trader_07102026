@@ -171,6 +171,7 @@ Telegram notifier preflight
   chat id:       123456789
   state file:    data/notify/telegram_state.json
   poll interval: 30s
+  values from:   /etc/crypto-trader/env  (9 setting(s) in it)
   OK   database readable: 3 C3-C B-BTC_USDT suggestion(s) on record
   OK   Telegram accepted the bot token
   NOTE not primed yet. ...
@@ -178,14 +179,35 @@ Telegram notifier preflight
 Everything checks out.
 ```
 
-Two lines to read carefully:
+Three lines to read carefully:
 
-- **`watching: B-BTC_USDT C3-C (and nothing else)`** — this is the safety filter. If it says
-  anything else, stop and check Step 4.
+- **`watching: B-BTC_USDT C3-C (and nothing else)`** — the safety filter. If it says anything else,
+  stop and check Step 4.
+- **`values from: /etc/crypto-trader/env`** — it found your settings, and where.
 - **`OK Telegram accepted the bot token`** — your token works. If this says FAIL, go to
   Troubleshooting.
 
-`--check` sends **no message to anyone**, so you can run it as often as you like.
+`--check` sends **no message to anyone**, so run it as often as you like.
+
+> ### If you are reading an older copy of this guide
+>
+> An earlier version of this step did not work, and the failure looked exactly like a mistake on
+> your side:
+>
+> ```
+> TELEGRAM NOTIFIER NOT CONFIGURED: CT_TELEGRAM__BOT_TOKEN is not set
+> ```
+>
+> **even with the variables correctly entered in `/etc/crypto-trader/env`.**
+>
+> The reason: that file is a *systemd* environment file. systemd loads it when it **starts a
+> service**. Running a command yourself in the shell does not load it — your shell has never heard
+> of that file. So the check genuinely could not see your settings, no matter how right they were.
+>
+> That is fixed. The notifier now reads `/etc/crypto-trader/env` itself when a value is not already
+> in the environment, so this command and the running service see exactly the same settings. If you
+> are still getting that message, you are on the old code — run Step 5 again (`git push` on your
+> laptop, then `update.sh` on the VM) and check that the `values from:` line appears.
 
 ### Send yourself one test message
 
@@ -337,14 +359,31 @@ After any future `update.sh`, the notifier is restarted automatically along with
 
 ### "TELEGRAM NOTIFIER NOT CONFIGURED: CT_TELEGRAM__BOT_TOKEN is not set"
 
-The variable isn't in `/etc/crypto-trader/env`, or the service was started before you added it.
+The message now tells you which of four situations you are in — read the `likely cause` line:
+
+| What the cause says | What it means | Fix |
+|---|---|---|
+| `...has no line for it (the file was read and holds N other setting(s))` | The file is fine and that one line is genuinely absent | Add it — Step 4 |
+| `...has a line for it but nothing after the '='` | The line is there and empty | Put the value right after the `=`, no spaces, no quotes |
+| `...does not exist` | Wrong path, or the file was never created | Check `ls -l /etc/crypto-trader/env` |
+| `...cannot read it... run with 'sudo -u crypto'` | A permissions problem, not a missing value | Use `sudo -u crypto ...` as every command in this guide does |
+
+Start by confirming the two lines are present:
 
 ```bash
-sudo grep CT_TELEGRAM /etc/crypto-trader/env     # should show both lines
+sudo grep CT_TELEGRAM /etc/crypto-trader/env
+```
+
+You should see both, each with a value after the `=`. If you just edited the file and the **service**
+still says this, restart it — a service only reads that file when it starts:
+
+```bash
 sudo systemctl restart crypto-notify
 ```
 
-A service only reads that file when it starts, so a change needs a restart.
+> **If you are on older code**, this message appears even when the file is perfectly correct,
+> because a command run by hand did not read the systemd environment file at all. See the note in
+> Step 6. Running Step 5 again fixes it.
 
 ### "Telegram rejected the bot token"
 

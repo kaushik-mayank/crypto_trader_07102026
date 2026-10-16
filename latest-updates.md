@@ -1088,6 +1088,7 @@ against a fresh holdout; API-change drill.
 | **D-62** | Where a strategy publishes no fixed target, the UI shows the **live trail** rather than the word "none" | `specs/06` §4.1 mandates no T1 for the trend strategies *and* `trail_level` published live; `c2_participation.py` says "the UI shows the live trail instead". The trail was computed and published in the detail, never persisted and never displayed, so a correct design read as a half-built suggestion with no exit. Fixed at both ends rather than by manufacturing a target, which would contradict the one thing those specs are most emphatic about (F-068) |
 | **D-63** | Suggestion timestamps display in **IST via a fixed +05:30 offset**; the UTC day grouping and every market-data timeline stay UTC | IST has no DST, so the arithmetic is exact and needs no browser timezone database; shifting the instant and reading `getUTC*` is viewer-independent, where `getHours()` would double-convert. The grouping stays UTC because moving it would change which suggestions fall in which group — a data change rather than a presentation one — so a late-UTC-day suggestion shows an IST date one day later, and the UI states that and offers the UTC reading on hover (F-069) |
 | **D-64** | The Telegram notifier is a **separate read-only process**, not a hook in the evaluation path | `AuditTrail.record_evaluation` writes the signal row, its event, its audit trace and the arbitration events in one transaction, "together or not at all". An outbound HTTPS call inside it would let a slow Telegram delay the evaluation loop and a raised exception roll back the audit record for the whole pass — the suggestion engine must not be able to fail because a chat app is down. The notifier therefore opens `file:...?mode=ro` (SQLite refuses a write), runs as its own systemd unit with no `Requires=`, and keeps its cursor in its own JSON file rather than a new table. A test asserts no existing module imports it (F-070) |
+| **D-65** | The notifier reads `/etc/crypto-trader/env` itself when a value is absent from its environment, with the real environment always winning | `EnvironmentFile=` is loaded by systemd when it starts a unit and by nothing else, so a hand-run `--check` saw none of the operator's settings and reported them unset (F-071). Reading the file as a *fallback* makes the command and the service agree; keeping the environment ahead of it means the running service never consults the file and its behaviour is unchanged |
 | **D-16** | Every ruff ignore carries an inline reason | The ignores are deliberate patterns (long-lived recorder handles, pairwise `zip`, `Kind(str, Enum)`), not unfixed warnings. An unexplained ignore is indistinguishable from neglect |
 
 ---
@@ -1762,6 +1763,29 @@ transition, and `state_since_ms` because it is re-stamped on every republish —
 notified once a minute for the life of a setup.
 
 **990 tests pass**, ruff and mypy clean on 141 files.
+
+### PHASE-38a — The preflight could not see the configuration it reported on (2026-10-17)
+
+The owner entered the Telegram variables in `/etc/crypto-trader/env` correctly, and PHASE-38's
+Step 6 still said `CT_TELEGRAM__BOT_TOKEN is not set`. **`EnvironmentFile=` is a systemd
+directive** — systemd reads that file when it starts a unit, and a shell never does. The guide's
+verify-before-you-install step could not work by construction, and the error named the variable, so
+it read as the operator's mistake. Full account in `docs/findings.md` **F-071**.
+
+| Path | Change |
+|---|---|
+| `src/notify/config.py` | Reads the environment file itself as a **fallback**: real environment first (so the running service is unchanged), then the file, then the default. `parse_env_file`, `load_env_file`, and `_missing`, which distinguishes four causes that previously collapsed into one dead-end sentence |
+| `src/notify/__main__.py` | `--env-file`, and a `values from: <path> (N setting(s) in it)` preflight line — threaded in from the resolved path, not re-derived |
+| `TELEGRAM_HOSTING.md` | Step 6 corrected, with a note for anyone holding an older copy; the troubleshooting entry for that exact message is now a cause → fix table |
+| `tests/test_notify.py` | 36 → **52** tests: the reported failure reproduced, env-wins precedence, the four distinct causes, and the forms an operator might plausibly type |
+
+Still **no file under `src/` outside `src/notify/` modified**. **1006 tests pass**, ruff and mypy
+clean on 141 files.
+
+The general lesson, recorded because it applies beyond this feature: *a verification step must load
+configuration by the same path as the thing it verifies.* The other `--check` commands in the
+hosting guides share the gap and only avoid the symptom because every setting they read has a
+default — they answer quietly and wrongly rather than erroring.
 
 ## Next Action
 

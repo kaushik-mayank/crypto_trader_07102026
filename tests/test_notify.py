@@ -529,3 +529,176 @@ def test_the_poll_interval_has_a_floor(monkeypatch):
     monkeypatch.setenv("CT_TELEGRAM__CHAT_ID", "42")
     monkeypatch.setenv("CT_TELEGRAM__POLL_SECONDS", "1")
     assert load_config().poll_seconds == 5.0
+
+
+# ---- the environment file (F-071) -----------------------------------------------------------
+#
+# The original guide told an operator to run `python -m notify --check` *before* installing the
+# service. systemd reads `/etc/crypto-trader/env` when it starts a unit; a shell knows nothing about
+# it. So the command saw none of the variables and reported the token as unset however correctly it
+# had been entered — a step that could not work by construction.
+
+ENV_SAMPLE = """\
+# the real file has the API settings in it too
+CT_ENVIRONMENT=azure
+CT_SERVER__HOST=0.0.0.0
+CT_SERVER__AUTH_TOKEN=an-unrelated-api-token
+
+# ---- Telegram notifications: OPTIONAL ----
+CT_TELEGRAM__BOT_TOKEN=8012345678:AAFhQ9x_example
+CT_TELEGRAM__CHAT_ID=123456789
+"""
+
+
+def test_the_config_reads_the_systemd_environment_file_when_the_shell_has_not(tmp_path,
+                                                                              monkeypatch):
+    """The reported failure, reproduced and fixed: the values are in the file and not in the shell,
+    which is exactly what an operator has after editing `/etc/crypto-trader/env`."""
+    from notify.config import load_config
+
+    monkeypatch.delenv("CT_TELEGRAM__BOT_TOKEN", raising=False)
+    monkeypatch.delenv("CT_TELEGRAM__CHAT_ID", raising=False)
+    env_file = tmp_path / "env"
+    env_file.write_text(ENV_SAMPLE, encoding="utf-8")
+
+    config = load_config(env_file=env_file)
+    assert config.bot_token == "8012345678:AAFhQ9x_example"
+    assert config.chat_id == "123456789"
+    assert config.asset == "B-BTC_USDT" and config.strategy_id == "C3-C"
+
+
+def test_a_real_environment_variable_beats_the_file(tmp_path, monkeypatch):
+    """Under systemd the variable is already in the environment, so the service's behaviour must be
+    exactly what it was before the file was ever consulted."""
+    from notify.config import load_config
+
+    env_file = tmp_path / "env"
+    env_file.write_text(ENV_SAMPLE, encoding="utf-8")
+    monkeypatch.setenv("CT_TELEGRAM__BOT_TOKEN", "from-the-environment")
+    monkeypatch.setenv("CT_TELEGRAM__CHAT_ID", "999")
+
+    config = load_config(env_file=env_file)
+    assert config.bot_token == "from-the-environment"
+    assert config.chat_id == "999"
+
+
+def test_the_file_is_only_consulted_for_values_the_environment_lacks(tmp_path, monkeypatch):
+    from notify.config import load_config
+
+    env_file = tmp_path / "env"
+    env_file.write_text(ENV_SAMPLE, encoding="utf-8")
+    monkeypatch.setenv("CT_TELEGRAM__BOT_TOKEN", "from-the-environment")
+    monkeypatch.delenv("CT_TELEGRAM__CHAT_ID", raising=False)
+
+    config = load_config(env_file=env_file)
+    assert config.bot_token == "from-the-environment"
+    assert config.chat_id == "123456789", "the chat id still came from the file"
+
+
+@pytest.mark.parametrize("line,expected", [
+    ("CT_TELEGRAM__CHAT_ID=42", "42"),
+    ('CT_TELEGRAM__CHAT_ID="42"', "42"),
+    ("CT_TELEGRAM__CHAT_ID='42'", "42"),
+    ("export CT_TELEGRAM__CHAT_ID=42", "42"),
+    ("CT_TELEGRAM__CHAT_ID = 42", "42"),
+    ("CT_TELEGRAM__CHAT_ID=-1001234567890", "-1001234567890"),
+])
+def test_the_forms_an_operator_might_plausibly_type_all_parse(line, expected):
+    """An operator who writes quotes or `export` has done nothing wrong and should not end up with a
+    chat id containing quotation marks. A negative group id keeps its minus sign."""
+    from notify.config import parse_env_file
+
+    assert parse_env_file(line)["CT_TELEGRAM__CHAT_ID"] == expected
+
+
+def test_comments_and_junk_lines_are_skipped_not_fatal():
+    """The file is shared with the API settings. A malformed line elsewhere in it must not stop the
+    notifier reading the two values it came for."""
+    from notify.config import parse_env_file
+
+    values = parse_env_file("# a comment\n\nnot-a-pair\nCT_TELEGRAM__CHAT_ID=7\n=novalue\n")
+    assert values == {"CT_TELEGRAM__CHAT_ID": "7"}
+
+
+def test_a_token_with_a_colon_survives_parsing():
+    """Telegram tokens contain a colon, and splitting on the wrong character would truncate one."""
+    from notify.config import parse_env_file
+
+    token = "8012345678:AAFhQ9x_with:another:colon"
+    assert parse_env_file(f"CT_TELEGRAM__BOT_TOKEN={token}")["CT_TELEGRAM__BOT_TOKEN"] == token
+
+
+def test_a_missing_file_says_so_rather_than_blaming_the_variable(tmp_path, monkeypatch):
+    from core.errors import ConfigError
+    from notify.config import load_config
+
+    monkeypatch.delenv("CT_TELEGRAM__BOT_TOKEN", raising=False)
+    with pytest.raises(ConfigError) as caught:
+        load_config(env_file=tmp_path / "absent")
+    assert "does not exist" in caught.value.likely_cause
+    assert caught.value.context["env_file_readable"] is False
+
+
+def test_a_line_with_no_value_is_distinguished_from_a_missing_line(tmp_path, monkeypatch):
+    """`CT_TELEGRAM__BOT_TOKEN=` with nothing after it is a different mistake from forgetting the
+    line, and needs a different sentence to fix it."""
+    from core.errors import ConfigError
+    from notify.config import load_config
+
+    monkeypatch.delenv("CT_TELEGRAM__BOT_TOKEN", raising=False)
+    empty = tmp_path / "empty"
+    empty.write_text("CT_TELEGRAM__BOT_TOKEN=\nCT_SERVER__HOST=0.0.0.0\n", encoding="utf-8")
+    with pytest.raises(ConfigError) as caught:
+        load_config(env_file=empty)
+    assert "nothing after the '='" in caught.value.likely_cause
+
+    absent = tmp_path / "absent-line"
+    absent.write_text("CT_SERVER__HOST=0.0.0.0\n", encoding="utf-8")
+    with pytest.raises(ConfigError) as caught2:
+        load_config(env_file=absent)
+    assert "has no line for it" in caught2.value.likely_cause
+    assert "1 other setting" in caught2.value.likely_cause, (
+        "reporting that the file WAS read rules out a permissions problem at a glance"
+    )
+
+
+def test_an_unreadable_file_points_at_the_service_user(tmp_path, monkeypatch):
+    """The real file is `root:crypto` mode 0640, so running the command as the wrong user is a
+    plausible mistake with a specific fix."""
+    from notify.config import load_env_file
+
+    target = tmp_path / "env"
+    target.write_text(ENV_SAMPLE, encoding="utf-8")
+
+    def deny(*_a, **_k):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "read_text", deny)
+    values, problem = load_env_file(target)
+    assert values == {}
+    assert "sudo -u crypto" in (problem or "")
+
+
+def test_the_cli_accepts_an_env_file_and_the_preflight_names_the_source():
+    """The preflight prints where the values came from, because "I set it and it says unset" was the
+    entire failure and the answer is which source replied."""
+    import inspect
+
+    from notify import __main__ as cli
+
+    source = inspect.getsource(cli)
+    assert '"--env-file"' in source
+    assert "values from:" in source
+    assert "load_config(env_file=args.env_file)" in source
+
+
+def test_the_default_env_file_is_the_one_systemd_uses():
+    """If these two ever disagree, the command and the service read different configuration and the
+    preflight stops proving anything about the service."""
+    from pathlib import Path as P
+
+    from notify.config import DEFAULT_ENV_FILE
+
+    unit = (P(__file__).resolve().parents[1] / "deploy" / "azure"
+            / "crypto-notify.service").read_text(encoding="utf-8")
+    assert f"EnvironmentFile={DEFAULT_ENV_FILE.as_posix()}" in unit
