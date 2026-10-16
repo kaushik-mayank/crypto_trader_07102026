@@ -75,6 +75,15 @@ $AS_SERVICE ./.venv/bin/python -m app --check
 echo "==> restarting"
 systemctl restart crypto-ingest
 systemctl restart crypto-app
+# The notifier is optional, so this is guarded. `is-enabled` returns non-zero when the unit was
+# never installed, which must not fail the update of the two services that are. `set -e` is on, so
+# the guard has to be the `if` rather than the command's own exit code.
+if systemctl is-enabled crypto-notify >/dev/null 2>&1; then
+  systemctl restart crypto-notify
+  echo "    crypto-notify restarted"
+else
+  echo "    crypto-notify not installed; skipped (see TELEGRAM_HOSTING.md)"
+fi
 sleep 5
 systemctl is-active crypto-ingest crypto-app
 

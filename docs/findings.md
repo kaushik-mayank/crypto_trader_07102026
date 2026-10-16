@@ -2500,6 +2500,88 @@ Nothing in the backend changed: no stored value, no API field, no serialisation 
 range are untouched.
 
 ---
+
+---
+
+## F-070 — Telegram notifications for BTCUSDT C3-C, added without touching a line of the engine ✅
+
+**Date:** 2026-10-17 · **Problem class:** none (new capability) · **Added**
+
+Requirement: forward BTCUSDT C3-C suggestions to Telegram when one is triggered or changes state,
+on the explicit condition that nothing already working is disturbed.
+
+### The integration point, and the one that was rejected
+
+The obvious place is a hook in `AuditTrail.record_evaluation`, where every signal already passes.
+It was rejected on inspection: that method runs **inside one SQLite transaction** that writes the
+signal row, its lifecycle event, its decision trace and the arbitration events "together or not at
+all". An outbound HTTPS call there would mean a slow Telegram delays the evaluation loop, and a
+raised exception rolls back the audit record for the whole pass. **The suggestion engine must not be
+able to fail because a chat app is down.**
+
+So the notifier is a **separate process with a read-only connection**:
+
+| Property | How it is guaranteed |
+|---|---|
+| cannot write to the engine's database | `ReadOnlyStore` opens `file:...?mode=ro`; SQLite itself refuses. Asserted by a test that expects `OperationalError` on an `UPDATE` |
+| cannot delay or break evaluation | different process, no IPC, no shared lock held |
+| cannot be imported into the engine by accident | a test greps every module outside `src/notify/` for an import of it |
+| keeps its own state | one JSON file under `data/notify/`. No table, no migration, no second writer |
+
+`git status` after the change: **no file under `src/` modified** — only the new `src/notify/`
+package. Two deployment files gained additive, guarded sections.
+
+### What counts as "triggered or its state changed"
+
+Two tempting sources were checked and rejected on evidence:
+
+* **`signal_events`** writes a row on *every managed pass*, not per transition —
+  `audit/trail.py:_write_events` inserts whenever `progress` is present in the detail. Polling it
+  would notify once a minute for the lifetime of a tracked setup.
+* **`state_since_ms`** is re-stamped on every republish, so it moves without the state changing.
+
+So the source is the `signals.state` **value**, compared against what this notifier last sent for
+that `signal_id`. A new `signal_id` is "a suggestion appeared"; a different state is "it changed".
+
+### The filter is in the SQL
+
+`WHERE strategy_id = ? AND asset = ?`, parameterised. Reading everything and filtering in Python
+would work and would be one careless edit away from notifying on all of it; a `WHERE` clause cannot
+be bypassed by a later refactor of the loop. Verified against a fixture holding four near misses —
+C3-C on ETH and SOL, and C4-B and C1-C on BTC — none of which the notifier can see at all.
+
+"BTCUSDT" in the request is `B-BTC_USDT` in the `signals.asset` column. Both spellings resolve, plus
+four more, because a plausible typo that silently matched nothing would look exactly like "no
+suggestions have happened yet".
+
+### Three details that matter more than they look
+
+**The first poll primes and sends nothing.** A database with a month of history would otherwise
+produce a month of notifications the moment the service starts — useless, and the kind of surprise
+that gets a feature switched off.
+
+**A failed send is not recorded as sent**, so the next poll retries it; and each signal is tracked
+independently, so one undeliverable message cannot wedge the queue behind it. A message over
+Telegram's 4096-character limit is truncated rather than retried for ever.
+
+**The token never reaches a log.** `requests` puts the URL in its exception text and the URL
+contains the token, so only the exception *type* is reported. `redacted_token` shows a length and
+four characters — enough to tell two tokens apart, not enough to use one. Asserted by a test that
+raises a `ConnectionError` carrying a fake token and checks it does not survive into the result.
+
+### Verified
+
+36 tests. Live: `--check` run against the real database and the real Telegram API, which rejected a
+deliberately fake token with exactly the remediation text the guide tells an operator to follow.
+
+### One deployment bug caught in my own work
+
+The service unit first carried `ReadOnlyPaths=/opt/crypto-trader/data`, which looks like better
+hardening and **breaks the notifier**: SQLite in WAL mode must create and lock the `-shm` sidecar
+even for a read-only connection, so a read-only mount makes the database impossible to open.
+`crypto-app.service` already records the same finding in the same words. The guarantee therefore
+lives in the connection, not the filesystem, and the unit says so rather than implying a
+kernel-level protection the deployment cannot support.
 ## Open questions
 
 

@@ -1087,6 +1087,7 @@ against a fresh holdout; API-change drill.
 | **D-61** | The signal row's UPSERT updates every column that describes the signal's **current** state, and freezes only identity and provenance | `direction` was frozen while `entry`/`stop`/`targets` were updated, so a C3-C that armed pending as a placeholder LONG and resolved SHORT was stored as a long whose stop sat above its entry — the reported suggestion. `as_of_ms`, `snapshot_id` and the regime were frozen the same way, making the row claim a provenance its levels did not come from. `created_at_ms` and `armed_at_ms` stay frozen, because a suggestion must not migrate between date groups when its outcome is recorded (F-067) |
 | **D-62** | Where a strategy publishes no fixed target, the UI shows the **live trail** rather than the word "none" | `specs/06` §4.1 mandates no T1 for the trend strategies *and* `trail_level` published live; `c2_participation.py` says "the UI shows the live trail instead". The trail was computed and published in the detail, never persisted and never displayed, so a correct design read as a half-built suggestion with no exit. Fixed at both ends rather than by manufacturing a target, which would contradict the one thing those specs are most emphatic about (F-068) |
 | **D-63** | Suggestion timestamps display in **IST via a fixed +05:30 offset**; the UTC day grouping and every market-data timeline stay UTC | IST has no DST, so the arithmetic is exact and needs no browser timezone database; shifting the instant and reading `getUTC*` is viewer-independent, where `getHours()` would double-convert. The grouping stays UTC because moving it would change which suggestions fall in which group — a data change rather than a presentation one — so a late-UTC-day suggestion shows an IST date one day later, and the UI states that and offers the UTC reading on hover (F-069) |
+| **D-64** | The Telegram notifier is a **separate read-only process**, not a hook in the evaluation path | `AuditTrail.record_evaluation` writes the signal row, its event, its audit trace and the arbitration events in one transaction, "together or not at all". An outbound HTTPS call inside it would let a slow Telegram delay the evaluation loop and a raised exception roll back the audit record for the whole pass — the suggestion engine must not be able to fail because a chat app is down. The notifier therefore opens `file:...?mode=ro` (SQLite refuses a write), runs as its own systemd unit with no `Requires=`, and keeps its cursor in its own JSON file rather than a new table. A test asserts no existing module imports it (F-070) |
 | **D-16** | Every ruff ignore carries an inline reason | The ignores are deliberate patterns (long-lived recorder handles, pairwise `zip`, `Kind(str, Enum)`), not unfixed warnings. An unexplained ignore is indistinguishable from neglect |
 
 ---
@@ -1731,6 +1732,36 @@ as entry, so `boundary` is the outlier.
 
 **954 tests pass**, ruff and mypy clean on 136 files.
 
+
+### PHASE-38 — Telegram notifications for BTCUSDT C3-C (2026-10-17)
+
+One isolated, read-only capability. **No file under `src/` was modified** — the feature is a new
+package, and a test asserts no existing module imports it, so `src/notify/` can be deleted with no
+other effect.
+
+| Path | Change |
+|---|---|
+| `src/notify/config.py` | **New** — `CT_TELEGRAM__*` from the environment, deliberately *not* added to `config/settings.py` (which every working process imports). Token redaction |
+| `src/notify/telegram.py` | **New** — one POST, failures classified by whether a retry could help, never raises, never puts the URL (and so the token) in a message |
+| `src/notify/watcher.py` | **New** — read-only poll, SQL-level filter, per-signal dedupe, atomic state file, IST message formatting |
+| `src/notify/__main__.py` | **New** — `--check`, `--once`, `--dry-run`, `--test-message`, and a poll loop that survives every failure |
+| `deploy/azure/crypto-notify.service` | **New** — third unit, no `Requires=` on the other two |
+| `deploy/azure/env.example` | Optional `CT_TELEGRAM__*` section appended |
+| `deploy/azure/update.sh` | Restarts the notifier **only if installed**; a deployment without it is not an error |
+| `TELEGRAM_HOSTING.md` | **New** — BotFather, chat id, env placement, deploy, verify, operate, troubleshoot |
+| `tests/test_notify.py` | **New** — 36 tests, weighted to the filter and to isolation |
+| `docs/findings.md` | **F-070** |
+
+**Integration point.** A hook in `AuditTrail.record_evaluation` was rejected: that method runs inside
+one atomic transaction, so an HTTPS call there would let a slow Telegram delay evaluation and a raised
+exception roll back the whole pass's audit record. A separate read-only process cannot do either.
+
+**Change detection.** `signals.state` compared against the last state sent for that `signal_id`.
+`signal_events` was rejected because `_write_events` inserts on every managed pass rather than per
+transition, and `state_since_ms` because it is re-stamped on every republish — either would have
+notified once a minute for the life of a setup.
+
+**990 tests pass**, ruff and mypy clean on 141 files.
 
 ## Next Action
 

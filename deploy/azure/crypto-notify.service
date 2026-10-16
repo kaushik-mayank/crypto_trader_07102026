@@ -1,0 +1,56 @@
+# Process 3 of the topology, and the only optional one: forwards BTCUSDT C3-C suggestions to
+# Telegram.
+#
+# Deliberately NOT `Requires=` on either of the other two. This service is a reader. If it
+# crash-loops, stops, or is never enabled at all, the suggestion engine and the ingest recorder carry
+# on untouched — which is the condition this feature was added under.
+[Unit]
+Description=crypto-trader Telegram notifier (BTCUSDT C3-C only, read-only)
+Documentation=file:///opt/crypto-trader/TELEGRAM_HOSTING.md
+After=network-online.target crypto-app.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=crypto
+Group=crypto
+WorkingDirectory=/opt/crypto-trader
+EnvironmentFile=/etc/crypto-trader/env
+ExecStart=/opt/crypto-trader/.venv/bin/python -m notify
+
+# A notifier that cannot reach Telegram should keep trying rather than give up. RestartSec is longer
+# than the other services' because nothing depends on this one being up promptly.
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=crypto-notify
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# **`data/` is read-write here, and that is not an oversight.**
+#
+# The obvious hardening is `ReadOnlyPaths=/opt/crypto-trader/data`, and it does not work: SQLite in
+# WAL mode needs to create and lock the `-shm` sidecar **even for a read-only connection**, so a
+# read-only mount makes the database impossible to open at all. `crypto-app.service` records the
+# same finding in the same words, because it reads through the same `ReadOnlyStore`.
+#
+# So the filesystem is not where this guarantee lives. The connection is: `ReadOnlyStore` opens
+# `file:...?mode=ro`, and SQLite itself then refuses any write — asserted in
+# `tests/test_notify.py:test_the_notifier_cannot_write_to_the_engines_database`, which expects an
+# `OperationalError` on an UPDATE. Claiming a kernel-level guarantee here would have been a stronger
+# statement than the deployment can actually support.
+ReadWritePaths=/opt/crypto-trader/data /opt/crypto-trader/logs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+# Small: one SQLite read connection and one HTTPS request at a time.
+MemoryMax=200M
+
+[Install]
+WantedBy=multi-user.target
