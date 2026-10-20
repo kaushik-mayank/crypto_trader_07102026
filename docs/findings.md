@@ -2664,6 +2664,122 @@ reporting on.
 
 ---
 
+## F-072 — the notifier's trigger was `state`, and the suggestion populates without `state` moving ✅
+
+**Date:** 2026-10-20 · **Problem class:** application_bug (mine, in F-070's own design) · **Fixed**
+
+### The report
+
+Messages for BTCUSDT C3-C arrived, but the wrong set of them: the **blank-to-populated transition
+was never notified**, while every intermediate status step was. The operator learned the entry and
+stop from the `ENTER_NOW` message — i.e. only once price had already reached the trigger.
+
+### Root cause
+
+F-070 defined a notifiable event as "``signals.state`` differs from the state last sent for this
+``signal_id``". Three independently verified facts make that the wrong trigger for C3-C:
+
+1. **C3-C arms blank.** `c3_transition.py:_arm` publishes
+   `Levels(entry=None, stop=None, targets=())` with `pending_direction: True`, in state
+   `SETUP_DETECTED`, and stores `Direction.LONG` as an explicit *placeholder* ("the resolution
+   assigns it").
+2. **The levels are filled in without the state changing.** `_levels` returns blanks while
+   `context["pending"]` is set and real levels once `_resolve` returns a branch. The UPSERT in
+   `audit/trail.py` writes `entry=excluded.entry, stop=excluded.stop, targets=excluded.targets,
+   direction=excluded.direction` on **every** republish, with no reference to `state`.
+3. **The state moves on a different event.** `lifecycle.py:advance` leaves `SETUP_DETECTED` only
+   when `act_state.triggered` — price reaching `E(t)`. The resolution and the ACT trigger are not
+   the same event and generally not the same pass.
+
+So the sequence in production is:
+
+| pass | what the engine does | state | levels | old notifier |
+|---|---|---|---|---|
+| N | arms pending | SETUP_DETECTED | blank | **sends** (new signal) ✓ |
+| N+k | resolves: direction assigned, levels published | SETUP_DETECTED | **populated** | **silent** ✗ ← the missing message |
+| N+m | price reaches `E(t)` | ENTER_NOW | populated | **sends** ✗ (and this is where the operator first saw the levels, late) |
+| N+m+1 | entry tracked | TRIGGERED | populated | **sends** ✗ |
+| … | target reached | TARGET_HIT | populated | **sends** ✓ |
+
+One trigger, both faults: a state-change trigger is blind to the event that matters and fires on
+every event that does not.
+
+### Fix
+
+The trigger is now **three stages per `signal_id`, each sent at most once**, in
+`src/notify/watcher.py`:
+
+| stage | fires when | message |
+|---|---|---|
+| `detected` | the signal is seen for the first time | SETUP DETECTED, blank, as the dashboard shows it |
+| `populated` | `entry` **and** `stop` present **and** `pending_direction` no longer set | SUGGESTION READY, with the values |
+| `final` | state is `TARGET_HIT` or `STOPPED` | TARGET HIT / STOP-LOSS HIT |
+
+Every other transition is observed and deliberately not sent. **Nothing upstream was suppressed** to
+achieve that: the lifecycle, the events and the dashboard are untouched, and the eligibility
+decision lives entirely in the notifier.
+
+Four decisions inside that worth recording:
+
+* **`targets` is not required for `populated`.** `specs/06` §4.1 mandates no fixed T1 for the
+  trailed strategies, so requiring it would mean a trailed setup never reached the stage at all.
+* **Both `entry` and `stop`, not either.** A suggestion with an entry and no stop is not actionable,
+  and reporting it as ready invites acting on half of one.
+* **`pending_direction` blocks the stage even when levels are present**, because the stored
+  direction is a placeholder in that window — announcing a side the system has not chosen is the
+  F-067 mistake relocated into a message.
+* **A one-way latch per signal, not a fingerprint of the values.** Fingerprinting `(entry, stop,
+  targets)` would re-fire on every trail adjustment, since `_manage_triggered` moves the stop — one
+  message per poll for the life of a tracked setup. A new setup is a new `signal_id` and gets its
+  own sequence.
+
+Also: a signal **first seen already populated** (a restart, or armed and resolved between two polls)
+gets **one** message carrying the real values, not a blank "detected" followed by a populated one.
+The blank-to-populated transition is an event this process witnessed or it is not; manufacturing it
+would report something that never happened.
+
+The v1 state file is **discarded rather than migrated**: it recorded `signal_id -> last state sent`,
+which cannot say whether the populated message went out. Guessing either replays a message or drops
+one, so the next poll primes instead — at most one missed notification for a setup mid-flight,
+never a burst of stale ones. Same direction as `load_state`'s existing choice for a corrupt file.
+
+### Why the values are the dashboard's values, without calling the dashboard's endpoint
+
+The request asked for the frontend endpoint to be reused. `/api/signals/live` reads the same
+`signals` table through the same read-only store, and `services.py:_row_to_signal` performs **no
+value transformation** — it parses `payload` and `targets` as JSON, lifts `detail` to the top level
+(F-056) and reads `tradeable` from the payload. The notifier now does the same four things, and a
+test asserts field-for-field equivalence by running the real `SignalService._row_to_signal` against
+the same row.
+
+Consuming the endpoint over HTTP was rejected for a concrete reason, not a preference: `live()`
+filters `state IN ('SETUP_DETECTED','ENTER_NOW','TRIGGERED')`, so `TARGET_HIT` and `STOPPED` never
+appear in it and **stage `final` would have been impossible**. It would also have added an auth
+token, a network hop and a failure mode where the app process being down stops notifications. Both
+facts are asserted by tests.
+
+One real discrepancy with the dashboard *was* found and closed: `live()` drops rows with
+`tradeable = False` (`specs/13` §13 forbids any endpoint returning one) and the notifier did not, so
+a row it let through would have described a suggestion the operator cannot see anywhere. Only the two
+control strategies are untradeable today and neither is C3-C, so this changed no behaviour; it is
+guarded so it cannot start to matter silently.
+
+### Verified
+
+71 tests in `tests/test_notify.py` (was 52), **1025 in the suite**, ruff and mypy clean on 141 files.
+The end-to-end test walks seven observations — armed blank, repeat poll, resolved, `ENTER_NOW`,
+`TRIGGERED`, `TARGET_HIT`, repeat poll — and asserts **exactly three** messages in order, with the
+levels present in the second. Both faults have a named regression test, each of the five non-result
+terminal states is parametrised, and the equivalence with `_row_to_signal` is executed rather than
+asserted about source text.
+
+**Not verified against production rows.** The local `signals` table has **0 rows** (the 6 GB
+`data/state.db` on this machine is market data; signals live on the VM), so the evidence here is the
+code paths plus a deterministic reproduction, not observed history. The first live C3-C BTCUSDT
+setup after deployment is the real confirmation.
+
+---
+
 ## Open questions
 
 

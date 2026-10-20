@@ -17,7 +17,19 @@ import pytest
 
 from notify.config import DEFAULT_ASSET, DEFAULT_STRATEGY, TelegramConfig, normalise_asset
 from notify.telegram import MAX_MESSAGE_CHARS, SendResult, check_credentials, send_message
-from notify.watcher import Watcher, WatcherState, format_message, ist, load_state, save_state
+from notify.watcher import (
+    STAGE_DETECTED,
+    STAGE_FINAL,
+    STAGE_POPULATED,
+    Watcher,
+    WatcherState,
+    format_message,
+    is_populated,
+    ist,
+    load_state,
+    save_state,
+    stage_due,
+)
 from store import open_store
 from store.reader import ReadOnlyStore
 
@@ -61,10 +73,36 @@ def _config(tmp_path, **over):
                           state_file=tmp_path / "state.json", **over)
 
 
-def _watcher(path, tmp_path, *, primed=True, seen=None, **over):
+def _watcher(path, tmp_path, *, primed=True, stages=None, **over):
     reader = ReadOnlyStore(path)
     return Watcher(store=reader, config=_config(tmp_path, **over),
-                   state=WatcherState(seen=dict(seen or {}), primed=primed))
+                   state=WatcherState(stages={k: list(v) for k, v in (stages or {}).items()},
+                                      primed=primed))
+
+
+def _resolve(path, sid="btc-c3c", *, state="SETUP_DETECTED", direction="SHORT",
+             entry="112730", stop="113910", targets='["111500"]'):
+    """What the engine does on the pass where C3-C resolves: `pending` clears, the direction is
+    assigned and the levels are filled in — **with no requirement that `state` move**, because
+    `advance()` only leaves SETUP_DETECTED when price reaches the ACT trigger, a different event.
+
+    Written as its own helper because it is the exact sequence the bug lived in.
+    """
+    store = open_store(path)
+    store.conn.execute(
+        """UPDATE signals SET direction=?, state=?, entry=?, stop=?, targets=?,
+                  payload=json_set(payload, '$.detail.pending_direction', json('false'))
+           WHERE signal_id=?""",
+        (direction, state, entry, stop, targets, sid))
+    store.conn.commit()
+    store.close()
+
+
+def _set_state(path, state, sid="btc-c3c"):
+    store = open_store(path)
+    store.conn.execute("UPDATE signals SET state=? WHERE signal_id=?", (state, sid))
+    store.conn.commit()
+    store.close()
 
 
 # ---- the filter: one asset, one strategy, nothing else --------------------------------------
@@ -108,7 +146,7 @@ def test_a_non_qualifying_change_notifies_nothing(seeded, tmp_path):
     store.conn.commit()
     store.close()
 
-    watcher = _watcher(seeded, tmp_path, seen={"btc-c3c": "SETUP_DETECTED"})
+    watcher = _watcher(seeded, tmp_path, stages={"btc-c3c": [STAGE_DETECTED]})
     try:
         report = watcher.poll(dry_run=True)
         assert report["qualifying"] == 1
@@ -127,49 +165,111 @@ def test_the_first_poll_primes_and_sends_nothing(seeded, tmp_path):
         report = watcher.poll(dry_run=True)
         assert report["primed"] is True
         assert report["sent"] == 0
-        assert watcher.state.seen == {"btc-c3c": "SETUP_DETECTED"}
+        assert watcher.state.stages == {"btc-c3c": [STAGE_DETECTED]}, (
+            "the one qualifying row is blank and pending, so only `detected` is already reached"
+        )
     finally:
         watcher.store.close()
 
 
-def test_a_state_change_is_detected_once_and_not_repeated(seeded, tmp_path, monkeypatch):
-    """The whole behaviour: notify on a change, then stay quiet until the next one."""
+def test_an_intermediate_state_change_notifies_nothing(seeded, tmp_path, monkeypatch):
+    """**The first half of the reported defect, as a regression test.**
+
+    The old trigger was "the state differs from the state last sent", so SETUP_DETECTED ->
+    ENTER_NOW -> TRIGGERED produced three messages. A state change on its own is now not an event:
+    the setup is still blank and pending, and nothing about it is news.
+    """
     sent = []
     monkeypatch.setattr("notify.watcher.send_message",
                         lambda cfg, text: sent.append(text) or SendResult(ok=True, status=200))
 
-    store = open_store(seeded)
-    store.conn.execute("UPDATE signals SET state='TRIGGERED' WHERE signal_id='btc-c3c'")
-    store.conn.commit()
-    store.close()
-
-    watcher = _watcher(seeded, tmp_path, seen={"btc-c3c": "SETUP_DETECTED"})
+    watcher = _watcher(seeded, tmp_path, stages={"btc-c3c": [STAGE_DETECTED]})
     try:
-        assert watcher.poll()["sent"] == 1
-        assert len(sent) == 1 and "TRIGGERED" in sent[0] and "was SETUP_DETECTED" in sent[0]
-        # Nothing changed since: silent.
+        for state in ("ENTER_NOW", "TRIGGERED"):
+            _set_state(seeded, state)
+            assert watcher.poll()["sent"] == 0, f"{state} is not one of the three notifiable events"
+        assert sent == []
+    finally:
+        watcher.store.close()
+
+
+def test_no_separate_enter_now_message_is_ever_sent(seeded, tmp_path, monkeypatch):
+    """An explicit acceptance criterion, and worth its own test because ENTER_NOW is the transition
+    the old code happened to deliver the levels on — so "it worked, just late" was easy to mistake
+    for working."""
+    sent = []
+    monkeypatch.setattr("notify.watcher.send_message",
+                        lambda cfg, text: sent.append(text) or SendResult(ok=True, status=200))
+    watcher = _watcher(seeded, tmp_path, stages={"btc-c3c": [STAGE_DETECTED, STAGE_POPULATED]})
+    try:
+        _set_state(seeded, "ENTER_NOW")
         assert watcher.poll()["sent"] == 0
+        assert not any("ENTER" in t for t in sent)
+    finally:
+        watcher.store.close()
+
+
+def test_the_populated_suggestion_is_detected_with_no_state_change(seeded, tmp_path, monkeypatch):
+    """**The other half of the reported defect: the message that was missing entirely.**
+
+    C3-C arms blank and pending; the levels arrive on the pass where `_resolve` returns a branch,
+    and `lifecycle.py:advance` does not move the state then — it moves on the ACT trigger, which is
+    a different event. So the old state-change trigger could not see this at all, and the operator
+    first saw the levels on the ENTER_NOW message, late.
+    """
+    sent = []
+    monkeypatch.setattr("notify.watcher.send_message",
+                        lambda cfg, text: sent.append(text) or SendResult(ok=True, status=200))
+
+    watcher = _watcher(seeded, tmp_path, stages={"btc-c3c": [STAGE_DETECTED]})
+    try:
+        before = watcher.qualifying_rows()[0]
+        assert before["state"] == "SETUP_DETECTED" and not is_populated(before)
+
+        _resolve(seeded)                                  # levels filled in, state untouched
+
+        after = watcher.qualifying_rows()[0]
+        assert after["state"] == "SETUP_DETECTED", "the state deliberately did not move"
+        assert is_populated(after)
+
+        assert watcher.poll()["sent"] == 1
+        assert "SUGGESTION READY" in sent[0]
+        assert "112730" in sent[0] and "113910" in sent[0] and "111500" in sent[0], (
+            "entry, stop and target are the values the dashboard shows for this row"
+        )
+        assert "SHORT" in sent[0], "the resolved direction, no longer the placeholder"
+
+        # And not again, however many times the same populated row is observed.
+        assert watcher.poll()["sent"] == 0 and watcher.poll()["sent"] == 0
         assert len(sent) == 1
     finally:
         watcher.store.close()
 
 
-def test_a_new_qualifying_signal_notifies_even_with_no_state_change(seeded, tmp_path, monkeypatch):
-    """A suggestion appearing is the event; its state has not "changed" because there was no
-    previous one."""
+def test_a_signal_first_seen_already_populated_sends_one_message_not_two(seeded, tmp_path,
+                                                                        monkeypatch):
+    """A setup met mid-life — after a restart, or armed and resolved between two polls.
+
+    It must not get a blank "setup detected" followed by a populated one: the blank-to-populated
+    transition is an event this process either witnessed or did not, and manufacturing it would
+    report something that never happened.
+    """
     sent = []
     monkeypatch.setattr("notify.watcher.send_message",
                         lambda cfg, text: sent.append(text) or SendResult(ok=True, status=200))
     store = open_store(seeded)
-    _insert(store, "btc-c3c-2", "C3-C", "B-BTC_USDT", state="ENTER_NOW",
+    _insert(store, "btc-c3c-2", "C3-C", "B-BTC_USDT", state="ENTER_NOW", direction="LONG",
             entry="83000", stop="82500", targets=("84000",))
     store.conn.commit()
     store.close()
 
-    watcher = _watcher(seeded, tmp_path, seen={"btc-c3c": "SETUP_DETECTED"})
+    watcher = _watcher(seeded, tmp_path, stages={"btc-c3c": [STAGE_DETECTED]})
     try:
         assert watcher.poll()["sent"] == 1
-        assert "(new)" in sent[0] and "ENTER_NOW" in sent[0]
+        assert "83000" in sent[0] and "82500" in sent[0], "one message, carrying the real values"
+        assert watcher.state.already("btc-c3c-2") == {STAGE_DETECTED, STAGE_POPULATED}
+        assert watcher.poll()["sent"] == 0
+        assert len(sent) == 1
     finally:
         watcher.store.close()
 
@@ -203,15 +303,12 @@ def test_a_failed_send_is_not_recorded_so_the_next_poll_retries(seeded, tmp_path
         return SendResult(ok=False, status=500, error="Telegram returned 500", retryable=True)
 
     monkeypatch.setattr("notify.watcher.send_message", flaky)
-    store = open_store(seeded)
-    store.conn.execute("UPDATE signals SET state='TRIGGERED' WHERE signal_id='btc-c3c'")
-    store.conn.commit()
-    store.close()
+    _resolve(seeded)
 
-    watcher = _watcher(seeded, tmp_path, seen={"btc-c3c": "SETUP_DETECTED"})
+    watcher = _watcher(seeded, tmp_path, stages={"btc-c3c": [STAGE_DETECTED]})
     try:
         assert watcher.poll()["failed"] == 1
-        assert watcher.state.seen["btc-c3c"] == "SETUP_DETECTED", "not recorded as sent"
+        assert watcher.state.already("btc-c3c") == {STAGE_DETECTED}, "not recorded as sent"
         assert watcher.poll()["failed"] == 1
         assert attempts["n"] == 2, "the next poll tried again"
     finally:
@@ -222,21 +319,23 @@ def test_one_undeliverable_signal_does_not_block_the_others(seeded, tmp_path, mo
     """Each signal is tracked independently, so a message that can never be delivered cannot wedge
     the queue behind it."""
     def selective(cfg, text):
-        return SendResult(ok=not text.startswith("BTCUSDT · C3-C · bad"), status=200)
+        return SendResult(ok="undeliverable" not in text, status=200)
 
     monkeypatch.setattr("notify.watcher.send_message", selective)
+    _resolve(seeded)
     store = open_store(seeded)
-    store.conn.execute("UPDATE signals SET state='TRIGGERED' WHERE signal_id='btc-c3c'")
-    _insert(store, "btc-bad", "C3-C", "B-BTC_USDT", direction="bad", state="TRIGGERED")
+    _insert(store, "btc-bad", "C3-C", "B-BTC_USDT", direction="undeliverable", state="TRIGGERED")
     store.conn.commit()
     store.close()
 
-    watcher = _watcher(seeded, tmp_path, seen={"btc-c3c": "SETUP_DETECTED"})
+    watcher = _watcher(seeded, tmp_path, stages={"btc-c3c": [STAGE_DETECTED]})
     try:
         report = watcher.poll()
         assert report["sent"] == 1 and report["failed"] == 1
-        assert watcher.state.seen["btc-c3c"] == "TRIGGERED", "the deliverable one went through"
-        assert "btc-bad" not in watcher.state.seen
+        assert watcher.state.already("btc-c3c") == {STAGE_DETECTED, STAGE_POPULATED}, (
+            "the deliverable one went through"
+        )
+        assert "btc-bad" not in watcher.state.stages
     finally:
         watcher.store.close()
 
@@ -255,14 +354,34 @@ def test_an_unreadable_state_file_re_primes_rather_than_re_sending(tmp_path):
     path = tmp_path / "broken.json"
     path.write_text("{not json", encoding="utf-8")
     state = load_state(path)
-    assert state.seen == {} and state.primed is False
+    assert state.stages == {} and state.primed is False
 
 
 def test_the_state_file_round_trips(tmp_path):
     path = tmp_path / "state.json"
-    save_state(path, WatcherState(seen={"a": "TRIGGERED"}, primed=True))
+    save_state(path, WatcherState(stages={"a": [STAGE_DETECTED, STAGE_POPULATED]}, primed=True))
     back = load_state(path)
-    assert back.seen == {"a": "TRIGGERED"} and back.primed is True
+    assert back.stages == {"a": [STAGE_DETECTED, STAGE_POPULATED]} and back.primed is True
+
+
+def test_a_version_1_state_file_re_primes_rather_than_guessing(tmp_path):
+    """The old file recorded `signal_id -> last state sent`, which cannot be converted: it does not
+    say whether the populated message ever went out. Guessing wrong either replays a message or
+    drops one, so it is discarded and the next poll primes — at most one missed notification for a
+    setup mid-flight, never a burst of stale ones."""
+    path = tmp_path / "v1.json"
+    path.write_text(json.dumps({"version": 1, "primed": True,
+                                "seen": {"btc-c3c": "TRIGGERED"}}), encoding="utf-8")
+    state = load_state(path)
+    assert state.stages == {} and state.primed is False, "re-primes, sends nothing"
+
+
+def test_stages_are_recorded_in_order_not_in_set_order(tmp_path):
+    """So the file reads as a history of what happened to a setup."""
+    state = WatcherState()
+    for stage in (STAGE_FINAL, STAGE_DETECTED, STAGE_POPULATED):
+        state.record("x", stage)
+    assert state.stages["x"] == [STAGE_DETECTED, STAGE_POPULATED, STAGE_FINAL]
 
 
 # ---- the message is read, never computed ----------------------------------------------------
@@ -273,11 +392,12 @@ def test_the_message_reports_a_pending_setup_as_undecided(seeded, tmp_path):
     watcher = _watcher(seeded, tmp_path)
     try:
         row = watcher.qualifying_rows()[0]
-        text = format_message(row, previous_state=None)
+        text = format_message(row, stage=STAGE_DETECTED)
+        assert "SETUP DETECTED" in text
         assert "direction not yet decided" in text
         assert "112750.5" in text, "the level being watched is useful and is on the row"
         assert "no entry or stop yet" in text
-        assert "LONG" not in text.split("state:")[0], "the placeholder must not be printed"
+        assert "LONG" not in text.split("status:")[0], "the placeholder must not be printed"
     finally:
         watcher.store.close()
 
@@ -288,7 +408,7 @@ def test_the_message_shows_the_trail_where_there_is_no_fixed_target(tmp_path):
     row = {"signal_id": "x", "strategy_id": "C3-C", "asset": "B-BTC_USDT", "direction": "LONG",
            "state": "TRIGGERED", "entry": "83000", "stop": "82500", "targets": "[]",
            "trail_level": "82900", "created_at_ms": T0, "payload": {}, "detail": {}}
-    text = format_message(row, previous_state="ENTER_NOW")
+    text = format_message(row, stage=STAGE_POPULATED)
     assert "trailing stop: 82900" in text
     assert "no fixed target by design" in text
 
@@ -299,7 +419,7 @@ def test_the_message_states_that_nothing_is_placed_or_validated(tmp_path):
     row = {"signal_id": "x", "strategy_id": "C3-C", "asset": "B-BTC_USDT", "direction": "SHORT",
            "state": "TRIGGERED", "entry": "112730", "stop": "113910", "targets": '["111500"]',
            "created_at_ms": T0, "payload": {}, "detail": {}}
-    text = format_message(row, previous_state=None)
+    text = format_message(row, stage=STAGE_POPULATED)
     assert "never places, cancels or transfers" in text
     assert "not been validated" in text or "validated against history" in text
 
@@ -322,6 +442,228 @@ def test_the_message_computes_no_trading_value():
     source = inspect.getsource(format_message)
     for arithmetic in (" * atr", "Decimal(", " + s *", " - s *", "atr_1h"):
         assert arithmetic not in source, f"{arithmetic} suggests a computed level"
+
+
+# ---- the three notifications, and nothing else (PHASE-38b) -----------------------------------
+
+def test_the_whole_sequence_is_exactly_three_messages(seeded, tmp_path, monkeypatch):
+    """**The acceptance criterion, end to end**, through every intermediate state the engine really
+    passes through: armed blank -> resolved -> ACT trigger -> tracked -> target hit.
+
+    Seven observations, three messages. The four silent ones are the two lifecycle transitions and
+    the two repeat polls of an unchanged row.
+    """
+    sent = []
+    monkeypatch.setattr("notify.watcher.send_message",
+                        lambda cfg, text: sent.append(text) or SendResult(ok=True, status=200))
+
+    watcher = _watcher(seeded, tmp_path, primed=False)
+    try:
+        # 1. the notifier starts: records what exists, sends nothing.
+        assert watcher.poll()["primed"] is True
+        assert sent == []
+
+        # A fresh setup arms, blank and pending — the dashboard shows it detected with no levels.
+        store = open_store(seeded)
+        _insert(store, "btc-seq", "C3-C", "B-BTC_USDT",
+                detail={"pending_direction": True, "boundary": "112750.5"})
+        store.conn.commit()
+        store.close()
+
+        # 2. MESSAGE 1 — setup detected, blank.
+        assert watcher.poll()["sent"] == 1
+        assert "SETUP DETECTED" in sent[0]
+        assert "no entry or stop yet" in sent[0] and "direction not yet decided" in sent[0]
+
+        # 3. nothing changed: silent.
+        assert watcher.poll()["sent"] == 0
+
+        # 4. MESSAGE 2 — the boundary resolves. Levels appear; the state does NOT move.
+        _resolve(seeded, "btc-seq")
+        assert watcher.poll()["sent"] == 1
+        assert "SUGGESTION READY" in sent[1]
+        assert all(v in sent[1] for v in ("112730", "113910", "111500"))
+
+        # 5. price reaches the ACT trigger, then the entry is tracked: two state changes, silent.
+        for state in ("ENTER_NOW", "TRIGGERED"):
+            _set_state(seeded, state, "btc-seq")
+            assert watcher.poll()["sent"] == 0, f"{state} must not notify"
+
+        # 6. MESSAGE 3 — the target is hit.
+        _set_state(seeded, "TARGET_HIT", "btc-seq")
+        assert watcher.poll()["sent"] == 1
+        assert "TARGET HIT" in sent[2]
+
+        # 7. and it stays quiet afterwards.
+        assert watcher.poll()["sent"] == 0
+
+        assert len(sent) == 3, f"exactly three messages, got {len(sent)}"
+        assert watcher.state.already("btc-seq") == {STAGE_DETECTED, STAGE_POPULATED, STAGE_FINAL}
+    finally:
+        watcher.store.close()
+
+
+def test_a_stop_loss_hit_says_so_in_words(seeded, tmp_path, monkeypatch):
+    """The other result. "STOPPED" is the lifecycle's word; a phone preview needs the meaning."""
+    sent = []
+    monkeypatch.setattr("notify.watcher.send_message",
+                        lambda cfg, text: sent.append(text) or SendResult(ok=True, status=200))
+    _resolve(seeded, state="STOPPED")
+
+    watcher = _watcher(seeded, tmp_path, stages={"btc-c3c": [STAGE_DETECTED, STAGE_POPULATED]})
+    try:
+        assert watcher.poll()["sent"] == 1
+        assert "STOP-LOSS HIT" in sent[0] and "TARGET HIT" not in sent[0]
+        assert watcher.poll()["sent"] == 0, "a terminal row is observed forever and sent once"
+    finally:
+        watcher.store.close()
+
+
+@pytest.mark.parametrize("state", ["EXPIRED", "INVALIDATED", "SUPPRESSED", "MISSED", "HANDED_OFF"])
+def test_a_setup_ending_without_a_trade_is_not_notified(seeded, tmp_path, monkeypatch, state):
+    """The lifecycle has seven terminal states; only TARGET_HIT and STOPPED are a *result*. A setup
+    whose window elapsed is not news, and five extra message types would be exactly the noise the
+    requirement is about."""
+    sent = []
+    monkeypatch.setattr("notify.watcher.send_message",
+                        lambda cfg, text: sent.append(text) or SendResult(ok=True, status=200))
+    _resolve(seeded, state=state)
+
+    watcher = _watcher(seeded, tmp_path, stages={"btc-c3c": [STAGE_DETECTED, STAGE_POPULATED]})
+    try:
+        assert watcher.poll()["sent"] == 0
+        assert sent == []
+    finally:
+        watcher.store.close()
+
+
+def test_a_result_state_outranks_a_pending_suggestion(seeded, tmp_path):
+    """If a setup is somehow first observed already stopped, the message must be the result — not a
+    suggestion to take a trade that is already over."""
+    row = {"signal_id": "x", "state": "STOPPED", "entry": "1", "stop": "2", "detail": {}}
+    assert stage_due(row, set()) == STAGE_FINAL
+    assert stage_due(row, {STAGE_FINAL}) is None
+    # And a blank pending row owes only the detected message.
+    pending = {"signal_id": "y", "state": "SETUP_DETECTED", "entry": None, "stop": None,
+               "detail": {"pending_direction": True}}
+    assert stage_due(pending, set()) == STAGE_DETECTED
+    assert stage_due(pending, {STAGE_DETECTED}) is None
+
+
+def test_each_new_setup_gets_its_own_sequence(seeded, tmp_path, monkeypatch):
+    """Deduplication is per `signal_id`, so a completed setup cannot silence the next one."""
+    sent = []
+    monkeypatch.setattr("notify.watcher.send_message",
+                        lambda cfg, text: sent.append(text) or SendResult(ok=True, status=200))
+    watcher = _watcher(seeded, tmp_path, stages={"btc-c3c": [STAGE_DETECTED, STAGE_POPULATED,
+                                                             STAGE_FINAL]})
+    try:
+        store = open_store(seeded)
+        _insert(store, "btc-next", "C3-C", "B-BTC_USDT",
+                detail={"pending_direction": True, "boundary": "99000"})
+        store.conn.commit()
+        store.close()
+        assert watcher.poll()["sent"] == 1 and "SETUP DETECTED" in sent[0]
+        _resolve(seeded, "btc-next")
+        assert watcher.poll()["sent"] == 1 and "SUGGESTION READY" in sent[1]
+        assert len(sent) == 2
+    finally:
+        watcher.store.close()
+
+
+# ---- what "populated" means, read from the dashboard's own fields ----------------------------
+
+def test_a_pending_direction_is_not_populated_even_with_levels_present():
+    """The engine stores `Direction.LONG` as a *placeholder* while C3-C waits for the resolution
+    (`c3_transition.py:_arm`). Declaring the suggestion ready in that window would state a side the
+    system has not chosen — the F-067 mistake, in a message this time."""
+    row = {"entry": "112730", "stop": "113910", "detail": {"pending_direction": True}}
+    assert is_populated(row) is False
+    assert is_populated({**row, "detail": {"pending": True}}) is False
+    assert is_populated({**row, "detail": {}}) is True
+
+
+def test_an_entry_without_a_stop_is_not_populated():
+    """Both, not either. A suggestion with an entry and no stop is not actionable, and reporting it
+    as ready invites acting on half of one."""
+    assert is_populated({"entry": "112730", "stop": None, "detail": {}}) is False
+    assert is_populated({"entry": None, "stop": "113910", "detail": {}}) is False
+    assert is_populated({"entry": "", "stop": "113910", "detail": {}}) is False
+    # The column is TEXT and levels are stored as `str(Decimal)`, so a stringified None would
+    # otherwise read as a published level.
+    assert is_populated({"entry": "None", "stop": "113910", "detail": {}}) is False
+
+
+def test_a_trailed_setup_with_no_fixed_target_still_counts_as_populated():
+    """`specs/06` §4.1 mandates no fixed T1 for the trailed strategies, so requiring `targets` would
+    mean a trailed setup never reached the populated stage and never got its message."""
+    row = {"entry": "83000", "stop": "82500", "targets": [], "trail_level": "82900", "detail": {}}
+    assert is_populated(row) is True
+
+
+# ---- the values are the dashboard's values ---------------------------------------------------
+
+def test_the_notifier_projects_a_row_exactly_as_the_live_endpoint_does(seeded, tmp_path):
+    """**The basis for reading the table directly instead of calling `/api/signals/live`.**
+
+    `services.py:_row_to_signal` — which is what the endpoint the dashboard polls returns — does no
+    value transformation: it parses `payload` and `targets` as JSON, lifts `detail` to the top level
+    and reads `tradeable` from the payload. This asserts field-for-field that the notifier's own
+    projection of the same row agrees, so a message cannot show a number the dashboard does not.
+
+    Executed against the real service, not asserted about its source, because a comment claiming
+    equivalence is exactly what would survive the change that breaks it.
+    """
+    from api.services import SignalService
+
+    _resolve(seeded)
+    reader = ReadOnlyStore(seeded)
+    try:
+        watcher = Watcher(store=reader, config=_config(tmp_path))
+        mine = watcher.qualifying_rows()[0]
+
+        raw = reader.conn.execute("SELECT * FROM signals WHERE signal_id='btc-c3c'").fetchone()
+        theirs = SignalService(store=reader)._row_to_signal(raw)
+
+        for field_name in ("signal_id", "strategy_id", "asset", "direction", "state", "entry",
+                           "stop", "targets", "trail_level", "created_at_ms", "state_since_ms",
+                           "payload", "tradeable"):
+            assert mine[field_name] == theirs[field_name], f"{field_name} differs from the dashboard"
+        assert mine["detail"] == theirs["detail"], "detail is lifted the same way (F-056)"
+    finally:
+        reader.close()
+
+
+def test_an_untradeable_row_is_filtered_exactly_as_the_endpoint_filters_it(seeded, tmp_path):
+    """`specs/13` §13 forbids any endpoint returning `tradeable = False`, and `services.py:live`
+    drops them — so a row this notifier let through would describe a suggestion the operator cannot
+    see anywhere. Only the two controls are untradeable today and neither is C3-C; the guard is here
+    so that cannot start to matter silently."""
+    store = open_store(seeded)
+    store.conn.execute(
+        """UPDATE signals SET payload=json_set(payload, '$.tradeable', json('false'))
+           WHERE signal_id='btc-c3c'""")
+    store.conn.commit()
+    store.close()
+
+    watcher = _watcher(seeded, tmp_path)
+    try:
+        assert watcher.qualifying_rows() == [], "invisible on the dashboard, so invisible here"
+    finally:
+        watcher.store.close()
+
+
+def test_the_live_endpoint_could_not_have_delivered_the_final_message(seeded, tmp_path):
+    """Why the fix reads the table rather than switching to the endpoint the request suggested:
+    `live()` returns only the three active states, so TARGET_HIT and STOPPED never appear in it.
+    Consuming it would have made message 3 impossible."""
+    import inspect
+
+    from api.services import SignalService
+
+    source = inspect.getsource(SignalService.live)
+    assert "state IN ('SETUP_DETECTED','ENTER_NOW','TRIGGERED')" in source
+    assert "TARGET_HIT" not in source and "STOPPED" not in source
 
 
 # ---- the credential never leaks --------------------------------------------------------------

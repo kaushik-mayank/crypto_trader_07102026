@@ -16,16 +16,49 @@ Three properties, each a deliberate choice rather than a convenience:
    schema change and a second writer on the file the engine owns. A small JSON file under
    ``data/notify/`` costs nothing and keeps the feature deletable.
 
-**What counts as a change.** The ``signals`` row's ``state`` column, compared against the state this
-notifier last sent for that ``signal_id``. Two tempting alternatives were rejected on evidence:
+**What counts as a notifiable event, and why the state column alone was the wrong answer.**
+
+The first version notified whenever ``signals.state`` differed from the state last sent. That is
+wrong in both directions, and the two faults have the same cause:
+
+* **It missed the suggestion.** C3-C arms *pending*: ``_arm`` publishes
+  ``Levels(entry=None, stop=None, targets=())`` with ``pending_direction: True`` in state
+  ``SETUP_DETECTED``, and the levels are filled in later, on the pass where ``_resolve`` returns a
+  branch (``c3_transition.py:_levels`` returns blanks while ``context["pending"]`` is set). The
+  UPSERT in ``audit/trail.py`` writes ``entry=excluded.entry, stop=excluded.stop,
+  targets=excluded.targets`` on **every** republish, independently of ``state``. And
+  ``lifecycle.py:advance`` only leaves ``SETUP_DETECTED`` when ``act_state.triggered`` — price
+  reaching ``E(t)``, a *different* event from the resolution. So the blank-to-populated transition
+  routinely happens with the state column unchanged, and a state-change trigger cannot see it.
+* **It sent everything else.** ``SETUP_DETECTED -> ENTER_NOW -> TRIGGERED`` is three state changes,
+  so the operator got three messages — and only the ``ENTER_NOW`` one carried the levels, late.
+
+So the trigger is no longer "the state moved". It is **three stages per signal, each sent at most
+once**:
+
+======================  ==========================================================================
+``detected``            the signal is seen for the first time (blank, as the dashboard shows it)
+``populated``           ``entry`` and ``stop`` are present and the direction is no longer pending
+``final``               the state reached ``TARGET_HIT`` or ``STOPPED``
+======================  ==========================================================================
+
+Every other transition is observed and deliberately not sent. Nothing upstream is suppressed to
+achieve that: the states and events are untouched, and the eligibility decision lives here.
+
+Two tempting change sources were rejected on evidence and remain rejected:
 
 * ``signal_events`` writes a row on **every managed pass**, not only on a transition
   (``audit/trail.py:_write_events`` inserts whenever ``progress`` is present), so it would notify
   once a minute for the lifetime of a tracked setup.
 * ``state_since_ms`` is re-stamped on every republish, so it moves without the state changing.
 
-So the state value itself is the only honest signal of "something actually happened", and a new
-``signal_id`` is the honest signal of "a suggestion appeared".
+**The values are the dashboard's values.** ``/api/signals/live`` reads the same ``signals`` table
+through the same read-only store, and ``services.py:_row_to_signal`` performs *no* value
+transformation: it parses ``payload`` and ``targets`` as JSON, lifts ``detail`` to the top level and
+reads ``tradeable`` out of the payload. This module does the same four things, so what is sent is
+what is displayed. That equivalence is asserted by a test, because it is the whole basis for reading
+the table directly instead of adding an HTTP dependency on the app process -- which could not
+deliver stage ``final`` anyway, since ``live()`` returns only the three active states.
 """
 from __future__ import annotations
 
@@ -50,6 +83,17 @@ IST_OFFSET_MS = int(5.5 * 60 * 60 * 1000)
 #: years of headroom; the cap exists only so an unforeseen loop cannot grow the file without bound.
 MAX_TRACKED = 2000
 
+#: The two terminal states that are a **trade result**. The lifecycle has seven terminal states
+#: (`strategy/base.py:TERMINAL_STATES`); the other five -- EXPIRED, INVALIDATED, SUPPRESSED, MISSED,
+#: HANDED_OFF -- are a setup ending without a trade, and are not notified. A setup that quietly
+#: expires is not news; a stop being hit is.
+RESULT_STATES = frozenset({"TARGET_HIT", "STOPPED"})
+
+#: The three stages, in the order they can occur. Each is sent at most once per ``signal_id``.
+STAGE_DETECTED = "detected"
+STAGE_POPULATED = "populated"
+STAGE_FINAL = "final"
+
 
 def ist(ms: Any) -> str:
     """An epoch-millisecond timestamp as an IST wall clock, with the date."""
@@ -65,21 +109,49 @@ def ist(ms: Any) -> str:
 
 @dataclass
 class WatcherState:
-    """What has already been notified: ``signal_id -> the state last sent for it``."""
+    """What has already been notified: ``signal_id -> the stages already sent for it``."""
 
-    seen: dict[str, str] = field(default_factory=dict)
+    stages: dict[str, list[str]] = field(default_factory=dict)
     #: False until the first poll has recorded what already exists. See :meth:`Watcher.poll`.
     primed: bool = False
 
+    def already(self, signal_id: str) -> set[str]:
+        return set(self.stages.get(signal_id) or ())
+
+    def record(self, signal_id: str, stage: str) -> None:
+        done = self.already(signal_id)
+        done.add(stage)
+        # Stored in stage order rather than set order, so the file reads as a history.
+        self.stages[signal_id] = [s for s in (STAGE_DETECTED, STAGE_POPULATED, STAGE_FINAL)
+                                  if s in done]
+
     def to_dict(self) -> dict[str, Any]:
-        return {"version": 1, "primed": self.primed, "seen": dict(self.seen)}
+        return {"version": 2, "primed": self.primed,
+                "stages": {k: list(v) for k, v in self.stages.items()}}
 
     @classmethod
     def from_dict(cls, raw: Any) -> WatcherState:
+        """Rebuild the state. **A version-1 file is discarded, on purpose.**
+
+        A v1 file recorded ``signal_id -> last state sent``, which cannot be converted into stages:
+        it does not say whether the populated message ever went out, and guessing wrong either
+        replays a message or drops one. Discarding it means the next poll primes -- it records the
+        stage every current signal has already reached and sends nothing -- so the upgrade costs at
+        most one missed notification for a setup mid-flight, and never a burst of stale ones. That is
+        the same trade `load_state` already makes for a corrupt file, and the same direction.
+        """
         if not isinstance(raw, dict):
             return cls()
-        seen = raw.get("seen")
-        return cls(seen=dict(seen) if isinstance(seen, dict) else {},
+        stages = raw.get("stages")
+        if not isinstance(stages, dict):
+            if raw.get("seen") is not None:
+                log.info("notify_state_v1_discarded",
+                         detail="the state file predates the three-stage model and cannot be "
+                                "converted, because it does not record whether the populated "
+                                "message was sent. The next poll re-primes and sends nothing")
+            return cls()
+        return cls(stages={str(k): [str(s) for s in v] for k, v in stages.items()
+                           if isinstance(v, list)},
                    primed=bool(raw.get("primed", False)))
 
 
@@ -121,7 +193,70 @@ def save_state(path: Path, state: WatcherState) -> None:
                   remediation=f"check the owner and permissions of {path.parent}")
 
 
-def format_message(row: dict[str, Any], *, previous_state: str | None) -> str:
+def is_populated(row: dict[str, Any]) -> bool:
+    """Whether the dashboard would now show this setup's suggestion, rather than a blank.
+
+    The same two conditions the dashboard renders on, read from the same fields:
+
+    * ``detail.pending_direction`` -- true while C3-C is waiting to see which way the boundary
+      resolves. The engine stores ``Direction.LONG`` as a *placeholder* in that window
+      (``c3_transition.py:_arm``: "placeholder; the resolution assigns it"), so a populated
+      suggestion must not be declared while it is set, or the message states a side the system has
+      not chosen (F-067).
+    * ``entry`` and ``stop`` both present. Both, not either: a suggestion with an entry and no stop
+      is not actionable, and reporting it as populated would invite acting on half of one.
+
+    ``targets`` is deliberately **not** required. `specs/06` §4.1 mandates no fixed T1 for the
+    trailed strategies, so requiring it would mean a trailed setup never reached the populated stage
+    at all.
+    """
+    detail = _detail(row)
+    if detail.get("pending_direction") is True or detail.get("pending") is True:
+        return False
+    return _present(row.get("entry")) and _present(row.get("stop"))
+
+
+def _present(value: Any) -> bool:
+    """A level the engine actually published. ``None``, ``""`` and the string ``"None"`` are blanks.
+
+    The string form is checked because the column is TEXT -- levels are stored as
+    ``str(Decimal)`` -- and a stringified ``None`` would otherwise read as a published level.
+    """
+    return value is not None and str(value).strip() not in ("", "None")
+
+
+def stage_due(row: dict[str, Any], already: set[str]) -> str | None:
+    """Which of the three stages this row owes a message for, or ``None``.
+
+    Ordered, and the order is the point: a result state outranks everything, because a setup that
+    has already hit its stop should report that and not a suggestion to take it.
+    """
+    if str(row.get("state") or "") in RESULT_STATES:
+        return None if STAGE_FINAL in already else STAGE_FINAL
+    if STAGE_DETECTED not in already:
+        return STAGE_DETECTED
+    if STAGE_POPULATED not in already and is_populated(row):
+        return STAGE_POPULATED
+    return None
+
+
+def stages_reached(row: dict[str, Any]) -> list[str]:
+    """Every stage a row has *already* passed, for priming and for a first sighting.
+
+    Used so that a signal first seen already populated gets **one** message describing what is
+    actually there, not a blank "setup detected" followed by a populated one. The blank-to-populated
+    transition is an event this notifier witnessed or it is not; manufacturing it for a setup met
+    mid-life would report something that did not happen while this process was watching.
+    """
+    reached = [STAGE_DETECTED]
+    if is_populated(row):
+        reached.append(STAGE_POPULATED)
+    if str(row.get("state") or "") in RESULT_STATES:
+        reached.append(STAGE_FINAL)
+    return reached
+
+
+def format_message(row: dict[str, Any], *, stage: str) -> str:
     """One notification, built only from fields already on the row.
 
     Nothing is computed here. No level is derived, no direction inferred, no outcome judged — those
@@ -140,11 +275,7 @@ def format_message(row: dict[str, Any], *, previous_state: str | None) -> str:
     heading = f"{pretty_asset} · {row.get('strategy_id')} · "
     heading += "direction not yet decided" if pending else direction
 
-    lines = [
-        f"{heading}",
-        f"state: {state}" + (f"  (was {previous_state})" if previous_state else "  (new)"),
-        "",
-    ]
+    lines = [_headline(stage, row), "", heading, f"status: {state}", ""]
 
     if pending:
         lines.append("This setup is watching a level and will trade whichever way it resolves,")
@@ -174,6 +305,19 @@ def format_message(row: dict[str, Any], *, previous_state: str | None) -> str:
     lines += ["", "Suggestion only — this system never places, cancels or transfers anything,",
               "and nothing in it has been validated against history."]
     return "\n".join(lines)
+
+
+def _headline(stage: str, row: dict[str, Any]) -> str:
+    """The first line, which is all that shows in a phone's notification preview.
+
+    So it says which of the three things happened, in words, rather than a lifecycle constant.
+    """
+    if stage == STAGE_FINAL:
+        hit = "TARGET HIT" if str(row.get("state")) == "TARGET_HIT" else "STOP-LOSS HIT"
+        return f"{hit} - setup closed"
+    if stage == STAGE_POPULATED:
+        return "SUGGESTION READY - entry and stop now published"
+    return "SETUP DETECTED"
 
 
 def _detail(row: dict[str, Any]) -> dict[str, Any]:
@@ -234,6 +378,18 @@ class Watcher:
                 except (ValueError, json.JSONDecodeError):
                     record["payload"] = {}
             record["detail"] = _detail(record)
+            record["targets"] = _targets(record)
+            # The same firewall the API applies at its boundary. `specs/13` §13 requires that no
+            # endpoint return a signal with `tradeable = False`, and `services.py:live` drops them --
+            # so a row this filter let through would be one the dashboard never shows, and the
+            # message would describe a suggestion the operator cannot see anywhere. The two control
+            # strategies are the only untradeable ones today and neither is C3-C, so this changes
+            # nothing now; it is here so that it cannot start to matter silently.
+            payload_obj = record.get("payload")
+            record["tradeable"] = bool(payload_obj.get("tradeable", True)
+                                       if isinstance(payload_obj, dict) else True)
+            if not record["tradeable"]:
+                continue
             out.append(record)
         return out
 
@@ -251,7 +407,7 @@ class Watcher:
                                   "primed": False}
 
         if not self.state.primed:
-            self.state.seen = {r["signal_id"]: str(r["state"]) for r in rows}
+            self.state.stages = {r["signal_id"]: stages_reached(r) for r in rows}
             self.state.primed = True
             report["primed"] = True
             report["skipped"] = len(rows)
@@ -264,20 +420,23 @@ class Watcher:
                             "are notified")
             return report
 
-        changed = [r for r in rows
-                   if self.state.seen.get(r["signal_id"]) != str(r["state"])]
+        # At most one message per signal per pass: the stages are ordered, so a signal that owes two
+        # of them sends the earlier one now and the later one on the next poll. That keeps each
+        # message a report of one event instead of a digest of several.
+        due = [(r, stage) for r in rows
+               if (stage := stage_due(r, self.state.already(r["signal_id"]))) is not None]
         # Oldest first, so a burst arrives in the order it happened.
-        changed.reverse()
+        due.reverse()
 
-        for row in changed:
+        for row, stage in due:
             signal_id = row["signal_id"]
-            previous = self.state.seen.get(signal_id)
-            text = format_message(row, previous_state=previous)
+            first_sighting = not self.state.already(signal_id)
+            text = format_message(row, stage=stage)
             if dry_run:
                 report["skipped"] += 1
-                log.info("notify_dry_run", signal_id=signal_id, state=row["state"],
-                         previous_state=previous, message_chars=len(text))
-                print(f"--- would send for {signal_id} ---\n{text}\n")
+                log.info("notify_dry_run", signal_id=signal_id, stage=stage, state=row["state"],
+                         message_chars=len(text))
+                print(f"--- would send for {signal_id} ({stage}) ---\n{text}\n")
                 continue
 
             result = send_message(self.config, text)
@@ -285,15 +444,21 @@ class Watcher:
                 # Recorded **only on success**, so a failed send is retried on the next poll rather
                 # than lost. Each signal is tracked independently, so one undeliverable message
                 # cannot block the others.
-                self.state.seen[signal_id] = str(row["state"])
+                #
+                # On a *first* sighting every stage the row has already passed is recorded, not just
+                # the one sent. A setup met already populated has had its values reported by this
+                # very message, so claiming the blank-to-populated transition later would announce an
+                # event that never happened while this process was watching.
+                for reached in (stages_reached(row) if first_sighting else [stage]):
+                    self.state.record(signal_id, reached)
                 self.sent += 1
                 report["sent"] += 1
-                log.info("notify_sent", signal_id=signal_id, strategy=row["strategy_id"],
-                         asset=row["asset"], state=row["state"], previous_state=previous)
+                log.info("notify_sent", signal_id=signal_id, stage=stage,
+                         strategy=row["strategy_id"], asset=row["asset"], state=row["state"])
             else:
                 self.failures += 1
                 report["failed"] += 1
-                log.error("notify_failed", signal_id=signal_id, state=row["state"],
+                log.error("notify_failed", signal_id=signal_id, stage=stage, state=row["state"],
                           **result.to_dict(),
                           detail="not recorded as sent, so the next poll will try again")
 
@@ -304,10 +469,10 @@ class Watcher:
 
     def _prune(self) -> None:
         """Keep the state file bounded. Only reached if the cap is exceeded, which it should not be."""
-        if len(self.state.seen) <= MAX_TRACKED:
+        if len(self.state.stages) <= MAX_TRACKED:
             return
         keep = {r["signal_id"] for r in self.qualifying_rows()}
-        before = len(self.state.seen)
-        self.state.seen = {k: v for k, v in self.state.seen.items() if k in keep}
-        log.info("notify_state_pruned", before=before, after=len(self.state.seen),
+        before = len(self.state.stages)
+        self.state.stages = {k: v for k, v in self.state.stages.items() if k in keep}
+        log.info("notify_state_pruned", before=before, after=len(self.state.stages),
                  detail="entries for signals no longer in the table were dropped")

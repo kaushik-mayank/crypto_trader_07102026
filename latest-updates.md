@@ -1089,6 +1089,7 @@ against a fresh holdout; API-change drill.
 | **D-63** | Suggestion timestamps display in **IST via a fixed +05:30 offset**; the UTC day grouping and every market-data timeline stay UTC | IST has no DST, so the arithmetic is exact and needs no browser timezone database; shifting the instant and reading `getUTC*` is viewer-independent, where `getHours()` would double-convert. The grouping stays UTC because moving it would change which suggestions fall in which group — a data change rather than a presentation one — so a late-UTC-day suggestion shows an IST date one day later, and the UI states that and offers the UTC reading on hover (F-069) |
 | **D-64** | The Telegram notifier is a **separate read-only process**, not a hook in the evaluation path | `AuditTrail.record_evaluation` writes the signal row, its event, its audit trace and the arbitration events in one transaction, "together or not at all". An outbound HTTPS call inside it would let a slow Telegram delay the evaluation loop and a raised exception roll back the audit record for the whole pass — the suggestion engine must not be able to fail because a chat app is down. The notifier therefore opens `file:...?mode=ro` (SQLite refuses a write), runs as its own systemd unit with no `Requires=`, and keeps its cursor in its own JSON file rather than a new table. A test asserts no existing module imports it (F-070) |
 | **D-65** | The notifier reads `/etc/crypto-trader/env` itself when a value is absent from its environment, with the real environment always winning | `EnvironmentFile=` is loaded by systemd when it starts a unit and by nothing else, so a hand-run `--check` saw none of the operator's settings and reported them unset (F-071). Reading the file as a *fallback* makes the command and the service agree; keeping the environment ahead of it means the running service never consults the file and its behaviour is unchanged |
+| **D-66** | The notifier's trigger is three stages per signal — detected, populated, final — not a change in `signals.state` | C3-C publishes its levels on the resolution pass, and `advance()` only moves the state on the ACT trigger, so a state-change trigger misses the populated suggestion entirely and fires on every step that is not news (F-072). Stage `populated` is a one-way latch per `signal_id`, not a fingerprint of the values: `_manage_triggered` moves the trailing stop, so a fingerprint would re-fire every poll for the life of a tracked setup |
 | **D-16** | Every ruff ignore carries an inline reason | The ignores are deliberate patterns (long-lived recorder handles, pairwise `zip`, `Kind(str, Enum)`), not unfixed warnings. An unexplained ignore is indistinguishable from neglect |
 
 ---
@@ -1786,6 +1787,43 @@ The general lesson, recorded because it applies beyond this feature: *a verifica
 configuration by the same path as the thing it verifies.* The other `--check` commands in the
 hosting guides share the gap and only avoid the symptom because every setting they read has a
 default — they answer quietly and wrongly rather than erroring.
+
+### PHASE-38b — The notification trigger was the state column, and the suggestion populates without it (2026-10-20)
+
+Reported: the populated-suggestion message never arrived, while every intermediate status step did.
+One cause for both halves. F-070 notified when `signals.state` differed from the state last sent,
+and for C3-C that is blind to the only event that matters:
+
+* `c3_transition.py:_arm` publishes `entry=None, stop=None, targets=()` with
+  `pending_direction: True` in `SETUP_DETECTED`;
+* `audit/trail.py`'s UPSERT writes `entry/stop/targets/direction` on **every** republish,
+  independently of `state`;
+* `lifecycle.py:advance` leaves `SETUP_DETECTED` only when `act_state.triggered` — price reaching
+  `E(t)`, a different event from the resolution that publishes the levels.
+
+So the levels appear with the state unchanged (invisible to the old trigger), and the operator first
+saw them on the `ENTER_NOW` message, late. Full account in `docs/findings.md` **F-072**.
+
+| Path | Change |
+|---|---|
+| `src/notify/watcher.py` | The trigger is now three stages per `signal_id`, each sent once: `detected` (first sighting, blank), `populated` (`entry` **and** `stop` present and `pending_direction` clear), `final` (`TARGET_HIT`/`STOPPED`). `is_populated`, `stage_due`, `stages_reached`, per-stage headlines, and the dashboard's `tradeable` firewall mirrored |
+| `src/notify/__main__.py` | One line: the preflight counts `state.stages` instead of `state.seen` |
+| `tests/test_notify.py` | 52 → **71**: the end-to-end three-message sequence, a named regression test for each half of the defect, the five non-result terminal states parametrised, and field-for-field equivalence with the live endpoint's own `_row_to_signal` |
+| `TELEGRAM_HOSTING.md` | "What the messages look like" rewritten as the three messages with a table of what is deliberately not sent, plus a note for anyone on an older copy |
+
+**Only TARGET_HIT and STOPPED are notified of the seven terminal states.** EXPIRED, INVALIDATED,
+SUPPRESSED, MISSED and HANDED_OFF are a setup ending without a trade — visible on the dashboard,
+deliberately not on a phone.
+
+**Nothing upstream was suppressed.** The lifecycle, the events, the engine and the dashboard are
+untouched; the eligibility decision lives entirely in the notifier. Still **no file under `src/`
+outside `src/notify/` modified**. **1025 tests pass**, ruff and mypy clean on 141 files.
+
+The endpoint the request asked to reuse was evaluated and rejected on a concrete fact:
+`services.py:live` filters `state IN ('SETUP_DETECTED','ENTER_NOW','TRIGGERED')`, so stage `final`
+could not have been delivered from it. Instead the notifier's projection of a row is now asserted
+equal to `_row_to_signal`'s, executed against the real service — the values are the dashboard's
+values, from the same table through the same read-only store.
 
 ## Next Action
 

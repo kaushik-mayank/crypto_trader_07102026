@@ -11,7 +11,8 @@ stop there and say what you saw.
 ## What this does, and what it cannot do
 
 A third service is added alongside the two you already run. It **reads** the database the engine
-writes, notices when a BTCUSDT C3-C suggestion changes, and sends you a message.
+writes and sends you a message at three moments in a BTCUSDT C3-C suggestion's life — and at no
+other moment.
 
 | | |
 |---|---|
@@ -292,9 +293,10 @@ every other row in that list is invisible to the notifier.
 sudo journalctl -u crypto-notify -f
 ```
 
-Leave it running. When a BTCUSDT C3-C suggestion changes state you'll see `notify_sent` with the
-signal id, the new state and the old one. You will **not** see a line for any other coin or
-strategy, because those rows never reach the code that logs.
+Leave it running. When one of the three notifications goes out you'll see `notify_sent` with the
+signal id and which `stage` it was (`detected`, `populated` or `final`). You will **not** see a line
+for any other coin or strategy, because those rows never reach the code that logs. You will also not
+see one for an ordinary status change, because those are deliberately not notified.
 
 Press **Ctrl+C** to stop watching.
 
@@ -302,9 +304,38 @@ Press **Ctrl+C** to stop watching.
 
 ## What the messages look like
 
+**You get three messages per suggestion, and no more.** Each one is a different moment, and the
+first line tells you which.
+
+### 1. SETUP DETECTED — the setup is spotted, with no numbers yet
+
 ```
+SETUP DETECTED
+
+BTCUSDT · C3-C · direction not yet decided
+status: SETUP_DETECTED
+
+This setup is watching a level and will trade whichever way it resolves,
+so it has no entry or stop yet.
+level being watched: 112750.5
+
+suggested: 2026-10-12 11:51 IST
+
+Suggestion only — this system never places, cancels or transfers anything,
+and nothing in it has been validated against history.
+```
+
+**"direction not yet decided" with no entry or stop is correct, not a bug.** C3-C watches a price
+level and trades whichever way it breaks, so it has no direction and no levels until the market
+gives it one. This is the same blank state the dashboard shows at this moment.
+
+### 2. SUGGESTION READY — the numbers arrive
+
+```
+SUGGESTION READY - entry and stop now published
+
 BTCUSDT · C3-C · SHORT
-state: TRIGGERED  (was SETUP_DETECTED)
+status: SETUP_DETECTED
 
 entry: 112730
 stop:  113910
@@ -319,14 +350,45 @@ Suggestion only — this system never places, cancels or transfers anything,
 and nothing in it has been validated against history.
 ```
 
+This is the message that matters, and it arrives **as soon as the dashboard has the numbers** — not
+later, when the price reaches the entry.
+
+Notice that `status:` still says `SETUP_DETECTED`. That is normal and is worth understanding: the
+levels being published and the price reaching them are two different events, and this message is
+about the first one.
+
+Some setups say **"trailing stop: ... (no fixed target by design)"** instead of a target. Also
+correct — some strategies deliberately have no fixed target and trail the position instead.
+
+### 3. TARGET HIT / STOP-LOSS HIT — how it ended
+
+```
+TARGET HIT - setup closed
+
+BTCUSDT · C3-C · SHORT
+status: TARGET_HIT
+...
+```
+
 Times are **IST**, the same as the dashboard.
 
-Some messages will say **"direction not yet decided"** with no entry or stop. That is correct, not a
-bug: C3-C watches a price level and trades whichever way it breaks, so it has no direction until the
-market gives it one. A second message arrives when it resolves.
+### What you will deliberately *not* get
 
-Some will say **"trailing stop: ... (no fixed target by design)"**. Also correct — some strategies
-deliberately have no fixed target and trail the position instead.
+| Not sent | Why |
+|---|---|
+| a message when the status changes to `ENTER_NOW` | the numbers were already sent in message 2; this adds nothing |
+| a message when the status changes to `TRIGGERED` | the same suggestion, one step further along |
+| a second copy of any of the three | each is sent once per setup, and that is recorded on disk so a restart does not repeat it |
+| a message when a setup `EXPIRED`, was `INVALIDATED`, `SUPPRESSED`, `MISSED` or `HANDED_OFF` | the setup ended **without a trade**. Only a target or a stop is a result |
+
+If you *want* to see those, the dashboard shows all of them. The notifier is deliberately quieter
+than the dashboard, so that a message on your phone always means one of three specific things.
+
+> **If you are reading an older copy of this guide**, it said a message arrives whenever a
+> suggestion "changes state". That was the original behaviour and it was wrong in both directions:
+> it sent a message for every status step, and it **missed** message 2 entirely, because the numbers
+> are filled in without the status changing. Fixed — see `docs/findings.md` F-072. If you are still
+> getting an `ENTER_NOW` message, you are on the old code: run Step 5 again.
 
 ### How often to expect one
 

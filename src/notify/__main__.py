@@ -172,7 +172,7 @@ def _preflight(watcher: Watcher, config: Any, *, env_file: Path) -> int:
         print(f"  FAIL {credentials.error}")
 
     if watcher.state.primed:
-        print(f"  OK   state file primed: tracking {len(watcher.state.seen)} signal(s)")
+        print(f"  OK   state file primed: tracking {len(watcher.state.stages)} signal(s)")
     else:
         print("  NOTE not primed yet. The first real poll records what already exists and sends "
               "nothing, so starting the service will not replay history.")
